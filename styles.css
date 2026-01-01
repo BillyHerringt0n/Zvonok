@@ -2247,3 +2247,81 @@ body {
     cursor: pointer;
     font-size: 16px;
 }
+
+/* Улучшенное отображение участников звонка */
+.participant {
+    position: relative;
+    margin: 12px;
+    padding: 12px;
+    background: #2f3136;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 160px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    transition: transform 0.2s;
+}
+
+.participant:hover {
+    transform: translateY(-4px);
+}
+
+.participant-avatar {
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    background: #5865f2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    font-weight: bold;
+    color: white;
+    margin-bottom: 10px;
+}
+
+.participant-name {
+    font-size: 15px;
+    font-weight: 600;
+    color: #ffffff;
+    margin-bottom: 6px;
+    text-align: center;
+}
+
+.participant-status {
+    font-size: 13px;
+    color: #b9bbbe;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.participant-status.speaking {
+    color: #43b581; /* зелёный, когда говорит */
+}
+
+.participant-status.muted {
+    color: #faa61a; /* оранжевый, если заглушён */
+}
+
+.participant-status::before {
+    content: '';
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #43b581; /* зелёная точка — в звонке */
+}
+
+.participant-status.offline::before {
+    background: #ed4245; /* красная — вышел */
+}
+
+/* Сообщение, когда в звонке никого нет */
+.no-participants {
+    text-align: center;
+    color: #72767d;
+    font-size: 16px;
+    padding: 20px;
+    font-style: italic;
+}

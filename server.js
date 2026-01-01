@@ -22,6 +22,9 @@ const io = socketIO(server, {
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
+// Логирование для WebRTC
+const log = (msg, ...args) => console.log(`[WebRTC ${new Date().toISOString()}] ${msg}`, ...args);
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -122,12 +125,14 @@ app.post('/api/register', async (req, res) => {
                 id: user.id,
                 username: user.username,
                 email: user.email,
-                avatar: username.charAt(0).toUpperCase()
+                avatar: user.avatar,
+                status: user.status
             }
         });
+        
     } catch (error) {
-        console.error('Register error:', error);
-        res.status(500).json({ error: 'Registration failed' });
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
@@ -142,12 +147,12 @@ app.post('/api/login', async (req, res) => {
         
         const user = await userDB.findByEmail(email);
         if (!user) {
-            return res.status(400).json({ error: 'Invalid credentials' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
         
         const validPassword = await bcrypt.compare(password, user.password);
         if (!validPassword) {
-            return res.status(400).json({ error: 'Invalid credentials' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
         
         const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
@@ -158,119 +163,156 @@ app.post('/api/login', async (req, res) => {
                 id: user.id,
                 username: user.username,
                 email: user.email,
-                avatar: user.avatar || user.username.charAt(0).toUpperCase()
+                avatar: user.avatar,
+                status: user.status
             }
         });
+        
     } catch (error) {
         console.error('Login error:', error);
-        res.status(500).json({ error: 'Login failed' });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Get user profile
-app.get('/api/user/profile', authenticateToken, async (req, res) => {
+// Get current user
+app.get('/api/user', authenticateToken, async (req, res) => {
     try {
         const user = await userDB.findById(req.user.id);
-        res.json(user);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.json({
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            avatar: user.avatar,
+            status: user.status
+        });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to get profile' });
+        console.error('Get user error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Get all users
-app.get('/api/users', authenticateToken, async (req, res) => {
+// Update status
+app.put('/api/status', authenticateToken, async (req, res) => {
     try {
-        const users = await userDB.getAll();
-        res.json(users);
+        const { status } = req.body;
+        await userDB.updateStatus(req.user.id, status);
+        res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to get users' });
+        console.error('Update status error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// File upload
+// Create server
+app.post('/api/servers', authenticateToken, async (req, res) => {
+    try {
+        const { name } = req.body;
+        if (!name) {
+            return res.status(400).json({ error: 'Server name required' });
+        }
+        
+        const server = await serverDB.create(name, req.user.id);
+        await serverDB.addMember(server.id, req.user.id);
+        
+        res.json(server);
+    } catch (error) {
+        console.error('Create server error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get user servers
+app.get('/api/servers', authenticateToken, async (req, res) => {
+    try {
+        const servers = await serverDB.getUserServers(req.user.id);
+        res.json(servers);
+    } catch (error) {
+        console.error('Get servers error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get server members
+app.get('/api/servers/:id/members', authenticateToken, async (req, res) => {
+    try {
+        const members = await serverDB.getMembers(req.params.id);
+        res.json(members);
+    } catch (error) {
+        console.error('Get members error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Upload file
 app.post('/api/upload', authenticateToken, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
         }
         
-        const { channelId } = req.body;
-        const fileRecord = await fileDB.create(
-            req.file.filename,
-            req.file.path,
-            req.file.mimetype,
-            req.file.size,
-            req.user.id,
-            channelId
-        );
-        
-        res.json({
-            id: fileRecord.id,
+        const fileData = {
             filename: req.file.originalname,
-            url: `/uploads/${req.file.filename}`,
-            type: req.file.mimetype,
-            size: req.file.size
-        });
+            filepath: `/uploads/${req.file.filename}`,
+            filetype: req.file.mimetype,
+            filesize: req.file.size,
+            user_id: req.user.id,
+            channel_id: req.body.channelId
+        };
+        
+        const file = await fileDB.create(fileData);
+        
+        res.json(file);
     } catch (error) {
         console.error('Upload error:', error);
-        res.status(500).json({ error: 'Upload failed' });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Get messages by channel
-app.get('/api/messages/:channelId', authenticateToken, async (req, res) => {
+// Friends routes
+app.post('/api/friends/request', authenticateToken, async (req, res) => {
     try {
-        const messages = await messageDB.getByChannel(req.params.channelId);
-        res.json(messages);
+        const { friendId } = req.body;
+        await friendDB.sendRequest(req.user.id, friendId);
+        res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to get messages' });
+        console.error('Friend request error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Get direct messages
-app.get('/api/dm/:userId', authenticateToken, async (req, res) => {
+app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     try {
-        const messages = await dmDB.getConversation(req.user.id, req.params.userId);
-        res.json(messages);
+        const { friendId } = req.body;
+        await friendDB.acceptRequest(req.user.id, friendId);
+        res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to get messages' });
+        console.error('Accept friend error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Server routes
-app.post('/api/servers', authenticateToken, async (req, res) => {
+app.post('/api/friends/reject', authenticateToken, async (req, res) => {
     try {
-        const { name } = req.body;
-        
-        if (!name || name.trim().length < 2) {
-            return res.status(400).json({ error: 'Server name must be at least 2 characters' });
-        }
-        
-        const server = await serverDB.create(name.trim(), req.user.id);
-        await serverDB.addMember(server.id, req.user.id);
-        
-        res.json(server);
+        const { friendId } = req.body;
+        await friendDB.rejectRequest(req.user.id, friendId);
+        res.json({ success: true });
     } catch (error) {
-        console.error('Create server error:', error);
-        res.status(500).json({ error: 'Failed to create server' });
+        console.error('Reject friend error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-app.get('/api/servers', authenticateToken, async (req, res) => {
+app.post('/api/friends/remove', authenticateToken, async (req, res) => {
     try {
-        const servers = await serverDB.getUserServers(req.user.id);
-        res.json(servers);
+        const { friendId } = req.body;
+        await friendDB.removeFriend(req.user.id, friendId);
+        res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to get servers' });
-    }
-});
-
-app.get('/api/servers/:serverId/members', authenticateToken, async (req, res) => {
-    try {
-        const members = await serverDB.getMembers(req.params.serverId);
-        res.json(members);
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to get server members' });
+        console.error('Remove friend error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
@@ -280,222 +322,116 @@ app.get('/api/friends', authenticateToken, async (req, res) => {
         res.json(friends);
     } catch (error) {
         console.error('Get friends error:', error);
-        res.status(500).json({ error: 'Failed to get friends' });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-app.get('/api/friends/pending', authenticateToken, async (req, res) => {
+app.get('/api/friends/requests', authenticateToken, async (req, res) => {
     try {
         const requests = await friendDB.getPendingRequests(req.user.id);
         res.json(requests);
     } catch (error) {
-        console.error('Get pending requests error:', error);
-        res.status(500).json({ error: 'Failed to get pending requests' });
+        console.error('Get requests error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Friend request routes
-app.post('/api/friends/request', authenticateToken, async (req, res) => {
-    try {
-        const { friendId } = req.body;
-        const result = await friendDB.sendRequest(req.user.id, friendId);
+// Socket.IO logic
+const users = new Map(); // socket.id -> user info
+const rooms = new Map(); // channelName -> Set of socket.ids
 
-        if (result.changes > 0) {
-            const receiverSocket = Array.from(users.values()).find(u => u.id === friendId);
-            if (receiverSocket) {
-                io.to(receiverSocket.socketId).emit('new-friend-request');
-            }
-        }
-
-        res.sendStatus(200);
-    } catch (error) {
-        console.error('Friend request error:', error);
-        res.status(500).json({ error: 'Failed to send friend request' });
-    }
-});
-
-app.post('/api/friends/accept', authenticateToken, async (req, res) => {
-    try {
-        const { friendId } = req.body;
-        await friendDB.acceptRequest(req.user.id, friendId);
-        res.sendStatus(200);
-    } catch (error) {
-        console.error('Accept friend request error:', error);
-        res.status(500).json({ error: 'Failed to accept friend request' });
-    }
-});
-
-app.post('/api/friends/reject', authenticateToken, async (req, res) => {
-    try {
-        const { friendId } = req.body;
-        await friendDB.rejectRequest(req.user.id, friendId);
-        res.sendStatus(200);
-    } catch (error) {
-        console.error('Reject friend request error:', error);
-        res.status(500).json({ error: 'Failed to reject friend request' });
-    }
-});
-
-app.delete('/api/friends/:friendId', authenticateToken, async (req, res) => {
-    try {
-        await friendDB.removeFriend(req.user.id, req.params.friendId);
-        res.sendStatus(200);
-    } catch (error) {
-        console.error('Remove friend error:', error);
-        res.status(500).json({ error: 'Failed to remove friend' });
-    }
-});
-
-// Store connected users
-const users = new Map();
-const rooms = new Map();
-
-// Socket.IO connection handling
-io.use((socket, next) => {
-    const token = socket.handshake.auth.token;
-    if (!token) {
-        return next(new Error('Authentication error'));
-    }
+io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
     
-    jwt.verify(token, JWT_SECRET, (err, decoded) => {
-        if (err) return next(new Error('Authentication error'));
-        socket.userId = decoded.id;
-        socket.userEmail = decoded.email;
-        next();
-    });
-});
-
-io.on('connection', async (socket) => {
-    console.log('User connected:', socket.userId);
-    
-    try {
-        const user = await userDB.findById(socket.userId);
-        
-        users.set(socket.id, {
-            ...user,
-            socketId: socket.id
-        });
-        
-        // Update user status
-        await userDB.updateStatus(socket.userId, 'Online');
-        
-        io.emit('user-list-update', Array.from(users.values()));
-    } catch (error) {
-        console.error('Error loading user:', error);
-    }
-
-    // User sends message
-    socket.on('send-message', async (messageData) => {
+    // Authentication
+    socket.on('authenticate', async (token) => {
         try {
-            const { channelId, message } = messageData;
+            const decoded = jwt.verify(token, JWT_SECRET);
+            const user = await userDB.findById(decoded.id);
+            if (!user) {
+                return socket.disconnect();
+            }
             
-            // Get user info
-            const user = await userDB.findById(socket.userId);
-            
-            // Save to database
-            const savedMessage = await messageDB.create(
-                message.text,
-                socket.userId,
-                channelId
-            );
-            
-            // Broadcast message with full user info
-            const broadcastMessage = {
-                id: savedMessage.id,
-                author: user.username,
+            users.set(socket.id, {
+                id: user.id,
+                username: user.username,
                 avatar: user.avatar || user.username.charAt(0).toUpperCase(),
-                text: message.text,
-                timestamp: new Date() // Client will format this
-            };
-            
-            io.emit('new-message', {
-                channelId,
-                message: broadcastMessage
+                status: user.status
             });
+            
+            socket.userId = user.id;
+            
+            await userDB.updateStatus(user.id, 'Online');
+            
+            io.emit('user-list-update', Array.from(users.values()));
+        } catch (error) {
+            console.error('Auth error:', error);
+            socket.disconnect();
+        }
+    });
+    
+    // Get online users
+    socket.on('get-online-users', () => {
+        socket.emit('user-list-update', Array.from(users.values()));
+    });
+    
+    // Send message to channel
+    socket.on('channel-message', async (data) => {
+        try {
+            const message = await messageDB.create(data.content, data.userId, data.channelId);
+            io.to(`channel-${data.channelId}`).emit('new-message', message);
         } catch (error) {
             console.error('Message error:', error);
         }
     });
-
-    // Direct message
-    socket.on('send-dm', async (data) => {
+    
+    // Send DM
+    socket.on('dm-message', async (data) => {
         try {
-            const { receiverId, message } = data;
-            const sender = await userDB.findById(socket.userId);
-
-            const savedMessage = await dmDB.create(
-                message.text,
-                socket.userId,
-                receiverId
-            );
-
-            const messagePayload = {
-                id: savedMessage.id,
-                author: sender.username,
-                avatar: sender.avatar || sender.username.charAt(0).toUpperCase(),
-                text: message.text,
-                timestamp: new Date()
-            };
-
-            // Send to receiver
-            const receiverSocket = Array.from(users.values())
-                .find(u => u.id === receiverId);
+            const message = await dmDB.create(data.content, data.senderId, data.receiverId);
             
-            if (receiverSocket) {
-                io.to(receiverSocket.socketId).emit('new-dm', {
-                    senderId: socket.userId,
-                    message: messagePayload
-                });
-            }
+            // Find receiver sockets
+            const receiverSockets = Array.from(users.entries())
+                .filter(([_, user]) => user.id === data.receiverId)
+                .map(([socketId]) => socketId);
             
-            // Send back to sender
-            socket.emit('dm-sent', {
-                receiverId,
-                message: messagePayload
+            receiverSockets.forEach(target => {
+                io.to(target).emit('new-dm', message);
             });
+            
+            socket.emit('new-dm', message); // Send back to sender
         } catch (error) {
             console.error('DM error:', error);
         }
     });
-
+    
+    // Typing indicators
+    socket.on('typing', (data) => {
+        socket.to(data.room).emit('typing', data);
+    });
+    
     // Add reaction
     socket.on('add-reaction', async (data) => {
         try {
-            const { messageId, emoji } = data;
-            await reactionDB.add(emoji, messageId, socket.userId);
-            
-            const reactions = await reactionDB.getByMessage(messageId);
-            io.emit('reaction-update', { messageId, reactions });
+            const reaction = await reactionDB.add(data.emoji, data.messageId, data.userId);
+            io.to(`channel-${data.channelId}`).emit('new-reaction', reaction);
         } catch (error) {
             console.error('Reaction error:', error);
         }
     });
-
-    // Remove reaction
-    socket.on('remove-reaction', async (data) => {
-        try {
-            const { messageId, emoji } = data;
-            await reactionDB.remove(emoji, messageId, socket.userId);
-            
-            const reactions = await reactionDB.getByMessage(messageId);
-            io.emit('reaction-update', { messageId, reactions });
-        } catch (error) {
-            console.error('Reaction error:', error);
-        }
+    
+    // Join channel
+    socket.on('join-channel', (channelId) => {
+        socket.join(`channel-${channelId}`);
     });
-
-    // Voice activity detection
-    socket.on('voice-activity', (data) => {
-        socket.broadcast.emit('user-speaking', {
-            userId: socket.userId,
-            speaking: data.speaking
-        });
+    
+    // Leave channel
+    socket.on('leave-channel', (channelId) => {
+        socket.leave(`channel-${channelId}`);
     });
-
-    // Join voice channel
-    socket.on('join-voice-channel', (channelData) => {
-        const { channelName, userId } = channelData;
-        
+    
+    // Voice channel join
+    socket.on('join-voice-channel', (channelName) => {
         socket.join(`voice-${channelName}`);
         
         if (!rooms.has(channelName)) {
@@ -503,40 +439,10 @@ io.on('connection', async (socket) => {
         }
         rooms.get(channelName).add(socket.id);
         
-        socket.to(`voice-${channelName}`).emit('user-joined-voice', {
-            userId,
-            socketId: socket.id
-        });
-        
-        const existingUsers = Array.from(rooms.get(channelName))
-            .filter(id => id !== socket.id)
-            .map(id => users.get(id));
-        
-        socket.emit('existing-voice-users', existingUsers);
+        socket.to(`voice-${channelName}`).emit('user-joined-voice', socket.id);
     });
-
-    // WebRTC signaling
-    socket.on('offer', (data) => {
-        socket.to(data.to).emit('offer', {
-            offer: data.offer,
-            from: socket.id
-        });
-    });
-
-    socket.on('answer', (data) => {
-        socket.to(data.to).emit('answer', {
-            answer: data.answer,
-            from: socket.id
-        });
-    });
-
-    socket.on('ice-candidate', (data) => {
-        socket.to(data.to).emit('ice-candidate', {
-            candidate: data.candidate,
-            from: socket.id
-        });
-    });
-
+    
+    // Leave voice
     socket.on('leave-voice-channel', (channelName) => {
         socket.leave(`voice-${channelName}`);
         
@@ -546,34 +452,49 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // Handle call initiation
+    // Handle call initiation — УЛУЧШЕННАЯ ВЕРСИЯ
     socket.on('initiate-call', (data) => {
-        const { to, type, from } = data;
-        console.log(`Call initiated from ${from.id} to ${to}, type: ${type}`);
-        
-        // Find receiver socket
-        const receiverSocket = Array.from(users.values()).find(u => u.id === to);
-        if (receiverSocket) {
-            // Send incoming call notification to receiver
-            io.to(receiverSocket.socketId).emit('incoming-call', {
-                from: {
-                    id: from.id,
-                    username: from.username,
-                    socketId: socket.id,
-                    avatar: from.username?.charAt(0).toUpperCase()
-                },
-                type: type
+        const { to, type = 'voice', from } = data;
+
+        if (!from || !from.id || !to) {
+            console.error('[Звонок] Ошибка: неполные данные от клиента', data);
+            return;
+        }
+
+        log(`Звонок инициирован от ${socket.id} (user: ${from.username}, id: ${from.id}) к userId: ${to}`);
+
+        // Ищем ВСЕ сокеты пользователя-получателя (на случай нескольких вкладок или реконнектов)
+        const receiverSockets = [];
+        for (const [socketId, userInfo] of users.entries()) {
+            if (userInfo.id === to) {
+                receiverSockets.push(socketId);
+            }
+        }
+
+        if (receiverSockets.length > 0) {
+            log(`Найдено ${receiverSockets.length} сокетов получателя. Отправляем incoming-call`);
+
+            receiverSockets.forEach((targetSocketId) => {
+                io.to(targetSocketId).emit('incoming-call', {
+                    from: {
+                        id: from.id,
+                        username: from.username,
+                        socketId: socket.id,  // сокет звонящего (для WebRTC)
+                        avatar: from.username?.charAt(0).toUpperCase() || 'U'
+                    },
+                    type: type
+                });
             });
         } else {
-            // User is offline
-            socket.emit('call-rejected', { message: 'User is offline' });
+            log(`Пользователь с id ${to} не найден в онлайн-списке (оффлайн или ошибка подключения)`);
+            socket.emit('call-rejected', { message: 'Пользователь оффлайн' });
         }
     });
 
     socket.on('accept-call', (data) => {
         const { to, from } = data;
-        console.log(`Call accepted by ${from.id}, connecting to ${to}`);
-        
+        log(`Звонок принят от ${socket.id} (userId: ${from.id}) к socket: ${to}`);
+
         // Notify the caller that call was accepted
         io.to(to).emit('call-accepted', {
             from: {
@@ -586,8 +507,8 @@ io.on('connection', async (socket) => {
 
     socket.on('reject-call', (data) => {
         const { to } = data;
-        console.log(`Call rejected, notifying ${to}`);
-        
+        log(`Звонок отклонён от ${socket.id} к socket: ${to}`);
+
         // Notify the caller that call was rejected
         io.to(to).emit('call-rejected', {
             from: socket.id,
@@ -599,6 +520,7 @@ io.on('connection', async (socket) => {
     socket.on('video-toggle', (data) => {
         const { to, enabled } = data;
         if (to) {
+            log(`Переключение видео от ${socket.id} к ${to}: ${enabled ? 'вкл' : 'выкл'}`);
             io.to(to).emit('video-toggle', {
                 from: socket.id,
                 enabled: enabled
@@ -610,8 +532,37 @@ io.on('connection', async (socket) => {
     socket.on('end-call', (data) => {
         const { to } = data;
         if (to) {
+            log(`Завершение звонка от ${socket.id} к ${to}`);
             io.to(to).emit('call-ended', { from: socket.id });
         }
+    });
+
+    // Добавленные обработчики для WebRTC сигнализации
+    socket.on('offer', (data) => {
+        const { to, offer } = data;
+        log(`Offer от ${socket.id} к ${to}`, offer.type);
+        io.to(to).emit('offer', {
+            from: socket.id,
+            offer: offer
+        });
+    });
+
+    socket.on('answer', (data) => {
+        const { to, answer } = data;
+        log(`Answer от ${socket.id} к ${to}`, answer.type);
+        io.to(to).emit('answer', {
+            from: socket.id,
+            answer: answer
+        });
+    });
+
+    socket.on('ice-candidate', (data) => {
+        const { to, candidate } = data;
+        log(`ICE-кандидат от ${socket.id} к ${to}`);
+        io.to(to).emit('ice-candidate', {
+            from: socket.id,
+            candidate: candidate
+        });
     });
 
     // Handle disconnection

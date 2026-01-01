@@ -21,6 +21,10 @@ let isCallMinimized = false; // ← ДОБАВЬТЕ ЭТУ СТРОКУ
 let callTimer = null;
 let callStartTime = null;
 let chatCallActive = false;
+let ringSound = null;
+let disconnectSound = null;
+let participants = new Map(); // socketId => {username, status}
+let connectSound = null;
 
 
 // Initialize
@@ -257,6 +261,13 @@ function endChatCall() {
 }
 
 function initializeApp() {
+	ringSound = document.getElementById('ringSound');
+    disconnectSound = document.getElementById('disconnectSound');
+	connectSound = document.getElementById('connectSound');
+
+    // Опционально: проверка, что звуки загрузились
+    if (!ringSound) console.error('Не найден элемент #ringSound');
+    if (!disconnectSound) console.error('Не найден элемент #disconnectSound');
     updateUserInfo();
     initializeFriendsTabs();
     initializeChannels();
@@ -340,52 +351,56 @@ function updateUserInfo() {
 function connectToSocketIO() {
     if (typeof io !== 'undefined') {
         socket = io({ auth: { token: token } });
-        
+
         socket.on('connect', () => {
             console.log('Connected to server');
         });
-        
-       socket.on('connect_error', (error) => {
-           console.error('Connection error:', error);
-           if (error.message === 'Authentication error') {
-               localStorage.removeItem('token');
-               localStorage.removeItem('currentUser');
-               window.location.replace('login.html');
-           }
-       });
-        
+
+        socket.on('connect_error', (error) => {
+            console.error('Connection error:', error);
+            if (error.message === 'Authentication error') {
+                localStorage.removeItem('token');
+                localStorage.removeItem('currentUser');
+                window.location.replace('login.html');
+            }
+        });
+
+        // === Сообщения в каналах ===
         socket.on('new-message', (data) => {
             const channelId = data.channelId;
             const channelName = getChannelNameById(channelId);
-
             if (!channels[channelName]) {
                 channels[channelName] = [];
             }
             channels[channelName].push(data.message);
-            
+
             if (channelName === currentChannel && currentView === 'server') {
                 addMessageToUI(data.message);
                 scrollToBottom();
             }
-            
+
             if (document.hidden) {
                 showNotification('New Message', `${data.message.author}: ${data.message.text}`);
             }
         });
-        
+
         socket.on('reaction-update', (data) => {
             updateMessageReactions(data.messageId, data.reactions);
         });
 
-        // WebRTC Signaling
+        // === WebRTC и голосовые звонки ===
         socket.on('user-joined-voice', (data) => {
             console.log('User joined voice:', data);
             createPeerConnection(data.socketId, true);
+
+            // Визуально добавляем участника в звонок
+            addParticipant(data.socketId, data.username || 'User');
         });
 
         socket.on('existing-voice-users', (users) => {
             users.forEach(user => {
                 createPeerConnection(user.socketId, false);
+                addParticipant(user.socketId, user.username || 'User');
             });
         });
 
@@ -394,26 +409,27 @@ function connectToSocketIO() {
                 peerConnections[socketId].close();
                 delete peerConnections[socketId];
             }
-            removeRemoteParticipant(socketId);
+
+            // Удаляем участника из интерфейса и проигрываем звук отключения
+            removeParticipant(socketId);
         });
 
+        // === Сигнализация WebRTC ===
         socket.on('offer', async (data) => {
-			console.log('Received offer (possible renegotiation) from:', data.from);
-			if (!peerConnections[data.from]) {
-				await createPeerConnection(data.from, false);
-			}
-			const pc = peerConnections[data.from];
-			try {
-				await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-				console.log('Remote description set (renegotiation)');
-				const answer = await pc.createAnswer();
-				await pc.setLocalDescription(answer);
-				socket.emit('answer', { to: data.from, answer: answer });
-				console.log('Answer sent (renegotiation)');
-			} catch (error) {
-				console.error('Error handling offer (renegotiation):', error);
-			}
-		});
+            console.log('Received offer from:', data.from);
+            if (!peerConnections[data.from]) {
+                await createPeerConnection(data.from, false);
+            }
+            const pc = peerConnections[data.from];
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit('answer', { to: data.from, answer: answer });
+            } catch (error) {
+                console.error('Error handling offer:', error);
+            }
+        });
 
         socket.on('answer', async (data) => {
             console.log('Received answer from:', data.from);
@@ -421,7 +437,6 @@ function connectToSocketIO() {
             if (pc) {
                 try {
                     await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-                    console.log('Answer processed successfully');
                 } catch (error) {
                     console.error('Error setting remote description:', error);
                 }
@@ -429,18 +444,17 @@ function connectToSocketIO() {
         });
 
         socket.on('ice-candidate', async (data) => {
-            console.log('Received ICE candidate from:', data.from);
             const pc = peerConnections[data.from];
             if (pc && data.candidate) {
                 try {
                     await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                    console.log('ICE candidate added');
                 } catch (error) {
                     console.error('Error adding ICE candidate:', error);
                 }
             }
         });
-        
+
+        // === Личные сообщения (DM) ===
         socket.on('new-dm', (data) => {
             if (data.senderId === currentDMUserId) {
                 addMessageToUI({
@@ -459,7 +473,7 @@ function connectToSocketIO() {
                 addMessageToUI({
                     id: data.message.id,
                     author: currentUser.username,
-                    avatar: currentUser.avatar,
+                    avatar: currentUser.avatar || currentUser.username.charAt(0).toUpperCase(),
                     text: data.message.text,
                     timestamp: data.message.timestamp
                 });
@@ -472,49 +486,93 @@ function connectToSocketIO() {
             showNotification('New Friend Request', 'You have a new friend request!');
         });
 
+        // === Входящий звонок ===
         socket.on('incoming-call', (data) => {
             const { from, type } = data;
             if (from) {
                 showIncomingCall(from, type);
+
+                // Запускаем рингтон
+                if (ringSound) {
+                    ringSound.currentTime = 0;
+                    ringSound.play().catch(e => console.error('Ошибка воспроизведения рингтона:', e));
+                }
+			
             }
         });
 
-		socket.on('call-accepted', (data) => {
-			console.log('Call accepted by:', data.from);
-			
-			// Обновляем статус звонка на "Connected"
-			document.getElementById('remoteCallStatus').textContent = 'Connected';
-			document.getElementById('callStatusText').innerHTML = `<span>Connected</span>`;
-			
-			// Запускаем таймер
-			startCallTimer();
-			
-			if (!peerConnections[data.from.socketId]) {
-				createPeerConnection(data.from.socketId, true);
-			}
-		});
+        // === Звонок принят ===
+        socket.on('call-accepted', (data) => {
+            console.log('Call accepted by:', data.from);
 
+            // Обновляем статус звонка
+            const statusEl = document.getElementById('remoteCallStatus');
+            const chatStatusEl = document.getElementById('callStatusText');
+            if (statusEl) statusEl.textContent = 'Connected';
+            if (chatStatusEl) chatStatusEl.innerHTML = `<span>Connected</span>`;
+
+            startCallTimer();
+
+            // Добавляем участника, если ещё нет
+            if (data.from && data.from.socketId) {
+                addParticipant(data.from.socketId, data.from.username);
+                if (!peerConnections[data.from.socketId]) {
+                    createPeerConnection(data.from.socketId, true);
+                }
+            }
+
+            // Останавливаем рингтон
+            if (ringSound && !ringSound.paused) {
+                ringSound.pause();
+                ringSound.currentTime = 0;
+            }
+			if (connectSound) {
+				connectSound.currentTime = 0;
+				connectSound.play().catch(e => console.error('Ошибка connect звука:', e));
+			}
+        });
+
+        // === Звонок отклонён ===
         socket.on('call-rejected', (data) => {
             alert('Call was declined');
+
             const callInterface = document.getElementById('callInterface');
-            callInterface.classList.add('hidden');
+            if (callInterface) callInterface.classList.add('hidden');
+
+            // Очищаем локальный поток
             if (localAudioStream) {
                 localAudioStream.getTracks().forEach(track => track.stop());
                 localAudioStream = null;
             }
             inCall = false;
+
+            // Останавливаем рингтон
+            if (ringSound && !ringSound.paused) {
+                ringSound.pause();
+                ringSound.currentTime = 0;
+            }
+			
         });
-        
+
+        // === Звонок завершён ===
         socket.on('call-ended', (data) => {
             console.log('Call ended by:', data.from);
-            if (peerConnections[data.from]) {
+
+            if (data.from && peerConnections[data.from]) {
                 peerConnections[data.from].close();
                 delete peerConnections[data.from];
+                removeParticipant(data.from);
             }
-            removeRemoteParticipant(data.from);
-            
+
+            // Если больше никого нет — выходим из звонка
             if (Object.keys(peerConnections).length === 0) {
                 leaveVoiceChannel(true);
+            }
+
+            // Останавливаем рингтон на всякий случай
+            if (ringSound && !ringSound.paused) {
+                ringSound.pause();
+                ringSound.currentTime = 0;
             }
         });
     }
@@ -829,31 +887,53 @@ function showIncomingCall(caller, type) {
     const incomingCallDiv = document.getElementById('incomingCall');
     const callerName = incomingCallDiv.querySelector('.caller-name');
     const callerAvatar = incomingCallDiv.querySelector('.caller-avatar');
-    
+
+    // Заполняем информацию о звонящем
     callerName.textContent = caller.username || 'Unknown User';
     callerAvatar.textContent = caller.avatar || caller.username?.charAt(0).toUpperCase() || 'U';
-    
+
+    // Показываем окно входящего звонка
     incomingCallDiv.classList.remove('hidden');
-    
-    // Set up accept/reject handlers
+
+    // === Обработчики кнопок ===
     const acceptBtn = document.getElementById('acceptCallBtn');
     const rejectBtn = document.getElementById('rejectCallBtn');
-    
+
+    // Принятие звонка
     acceptBtn.onclick = async () => {
         incomingCallDiv.classList.add('hidden');
         await acceptCall(caller);
+
+        // Останавливаем рингтон
+        if (ringSound && !ringSound.paused) {
+            ringSound.pause();
+            ringSound.currentTime = 0;
+        }
     };
-    
+
+    // Отклонение звонка
     rejectBtn.onclick = () => {
         incomingCallDiv.classList.add('hidden');
         rejectCall(caller);
+
+        // Останавливаем рингтон
+        if (ringSound && !ringSound.paused) {
+            ringSound.pause();
+            ringSound.currentTime = 0;
+        }
     };
-    
-    // Auto-reject after 30 seconds
+
+    // Автоматическое отклонение через 30 секунд
     setTimeout(() => {
         if (!incomingCallDiv.classList.contains('hidden')) {
             incomingCallDiv.classList.add('hidden');
             rejectCall(caller);
+
+            // Останавливаем рингтон при таймауте
+            if (ringSound && !ringSound.paused) {
+                ringSound.pause();
+                ringSound.currentTime = 0;
+            }
         }
     }, 30000);
 }
@@ -929,6 +1009,87 @@ window.startDM = async function(friendId, friendUsername) {
     
     await loadDMHistory(friendId);
 };
+
+function addParticipant(socketId, username) {
+    const container = document.getElementById('remoteParticipants');
+    if (!container) return;
+
+    // Удаляем, если уже есть
+    let div = document.getElementById(`participant-${socketId}`);
+    if (!div) {
+        div = document.createElement('div');
+        div.id = `participant-${socketId}`;
+        div.className = 'participant';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'participant-avatar';
+        avatar.textContent = username.charAt(0).toUpperCase();
+
+        const name = document.createElement('div');
+        name.className = 'participant-name';
+        name.textContent = username;
+
+        const status = document.createElement('div');
+        status.className = 'participant-status';
+        status.textContent = 'В звонке';
+
+        div.appendChild(avatar);
+        div.appendChild(name);
+        div.appendChild(status);
+        container.appendChild(div);
+    }
+
+    participants.set(socketId, { username, status: 'В звонке' });
+    updateNoParticipantsMessage();
+}
+
+function updateParticipantStatus(socketId, statusText, extraClass = '') {
+    const div = document.getElementById(`participant-${socketId}`);
+    if (div) {
+        const statusEl = div.querySelector('.participant-status');
+        statusEl.textContent = statusText;
+        statusEl.className = 'participant-status'; // сбрасываем классы
+        if (extraClass) statusEl.classList.add(extraClass);
+    }
+}
+
+function removeParticipant(socketId) {
+    const div = document.getElementById(`participant-${socketId}`);
+    if (div) {
+        // Показываем, что вышел
+        const statusEl = div.querySelector('.participant-status');
+        if (statusEl) {
+            statusEl.textContent = 'Вышел';
+            statusEl.classList.add('offline');
+        }
+        setTimeout(() => div.remove(), 2000); // удаляем через 2 секунды
+    }
+
+    participants.delete(socketId);
+    updateNoParticipantsMessage();
+
+    // Звук отключения
+    if (disconnectSound) {
+        disconnectSound.currentTime = 0;
+        disconnectSound.play().catch(e => console.error('Ошибка звука отключения:', e));
+    }
+}
+
+function updateNoParticipantsMessage() {
+    const container = document.getElementById('remoteParticipants');
+    let msg = container.querySelector('.no-participants');
+
+    if (participants.size === 0) {
+        if (!msg) {
+            msg = document.createElement('div');
+            msg.className = 'no-participants';
+            msg.textContent = 'Вы один в звонке';
+            container.appendChild(msg);
+        }
+    } else if (msg) {
+        msg.remove();
+    }
+}
 
 // Show friends view
 function showFriendsView() {
