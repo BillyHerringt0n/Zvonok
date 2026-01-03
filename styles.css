@@ -2247,3 +2247,586 @@ body {
     cursor: pointer;
     font-size: 16px;
 }
+
+/* Settings Modal Styles */
+.settings-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    backdrop-filter: blur(4px);
+    animation: fadeIn 0.3s ease;
+}
+
+.settings-modal.hidden {
+    display: none;
+}
+
+.settings-modal-content {
+    width: 800px;
+    max-width: 90vw;
+    max-height: 90vh;
+    background-color: #2f3136;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 16px 64px rgba(0, 0, 0, 0.8);
+    animation: modalSlideIn 0.3s ease;
+}
+
+@keyframes modalSlideIn {
+    from {
+        opacity: 0;
+        transform: translateY(-20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.settings-modal-header {
+    padding: 20px 24px;
+    border-bottom: 1px solid #202225;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: linear-gradient(135deg, #2b2d31 0%, #202225 100%);
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+}
+
+.settings-modal-header h2 {
+    font-size: 20px;
+    font-weight: 600;
+    color: #ffffff;
+    margin: 0;
+}
+
+.settings-close-btn {
+    background: none;
+    border: none;
+    color: #b9bbbe;
+    font-size: 28px;
+    cursor: pointer;
+    width: 36px;
+    height: 36px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.settings-close-btn:hover {
+    background-color: #ed4245;
+    color: white;
+}
+
+.settings-modal-body {
+    padding: 24px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.settings-section {
+    margin-bottom: 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid #36393f;
+}
+
+.settings-section:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+
+.settings-section h3 {
+    font-size: 16px;
+    font-weight: 600;
+    color: #ffffff;
+    margin-bottom: 16px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.settings-control {
+    margin-bottom: 20px;
+}
+
+.settings-control label {
+    display: block;
+    font-size: 14px;
+    color: #b9bbbe;
+    margin-bottom: 8px;
+    font-weight: 500;
+}
+
+.settings-select {
+    width: 100%;
+    padding: 10px 12px;
+    background-color: #40444b;
+    border: 1px solid #202225;
+    border-radius: 4px;
+    color: #ffffff;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.settings-select:focus {
+    border-color: #5865f2;
+}
+
+.settings-select option {
+    background-color: #2f3136;
+    color: #ffffff;
+}
+
+.volume-control {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-top: 8px;
+}
+
+.volume-slider {
+    flex: 1;
+    height: 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: #40444b;
+    border-radius: 3px;
+    outline: none;
+}
+
+.volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #5865f2;
+    cursor: pointer;
+    border: 2px solid #36393f;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+
+.volume-slider::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #5865f2;
+    cursor: pointer;
+    border: 2px solid #36393f;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+
+.volume-value {
+    min-width: 60px;
+    font-size: 14px;
+    color: #b9bbbe;
+    text-align: right;
+}
+
+.checkbox-control {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.checkbox-control input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+    background-color: #40444b;
+    border: 2px solid #202225;
+    border-radius: 4px;
+    cursor: pointer;
+    appearance: none;
+    position: relative;
+    transition: all 0.2s;
+}
+
+.checkbox-control input[type="checkbox"]:checked {
+    background-color: #5865f2;
+    border-color: #5865f2;
+}
+
+.checkbox-control input[type="checkbox"]:checked::after {
+    content: '✓';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: white;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+.checkbox-control label {
+    margin-bottom: 0;
+    cursor: pointer;
+    color: #dcddde;
+    font-weight: 400;
+}
+
+.settings-description {
+    font-size: 12px;
+    color: #72767d;
+    margin-top: 4px;
+    margin-left: 32px;
+    line-height: 1.4;
+}
+
+.radio-control {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.radio-control input[type="radio"] {
+    width: 18px;
+    height: 18px;
+    background-color: #40444b;
+    border: 2px solid #202225;
+    border-radius: 50%;
+    cursor: pointer;
+    appearance: none;
+    position: relative;
+    transition: all 0.2s;
+}
+
+.radio-control input[type="radio"]:checked {
+    border-color: #5865f2;
+}
+
+.radio-control input[type="radio"]:checked::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 8px;
+    height: 8px;
+    background-color: #5865f2;
+    border-radius: 50%;
+}
+
+.radio-control label {
+    margin-bottom: 0;
+    cursor: pointer;
+    color: #dcddde;
+    font-weight: 400;
+}
+
+.settings-btn {
+    padding: 10px 20px;
+    background-color: #4f545c;
+    border: none;
+    border-radius: 4px;
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.settings-btn:hover {
+    background-color: #5d6269;
+}
+
+.settings-btn.primary {
+    background-color: #5865f2;
+}
+
+.settings-btn.primary:hover {
+    background-color: #4752c4;
+}
+
+.settings-btn.secondary {
+    background-color: #4f545c;
+}
+
+.settings-btn.secondary:hover {
+    background-color: #5d6269;
+}
+
+.test-status {
+    margin-top: 12px;
+    padding: 8px 12px;
+    background-color: #36393f;
+    border-radius: 4px;
+    font-size: 14px;
+    color: #b9bbbe;
+    min-height: 20px;
+}
+
+.test-status.speaking {
+    color: #43b581;
+    animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.5;
+    }
+}
+
+.test-status.playing {
+    color: #5865f2;
+}
+
+.settings-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 32px;
+    padding-top: 24px;
+    border-top: 1px solid #36393f;
+}
+
+/* Device List Items */
+.device-option {
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+}
+
+.device-label {
+    font-size: 14px;
+    color: #ffffff;
+    font-weight: 500;
+}
+
+.device-id {
+    font-size: 12px;
+    color: #72767d;
+    margin-top: 2px;
+}
+
+/* Microphone Level Indicator */
+.mic-level-indicator {
+    height: 4px;
+    background-color: #40444b;
+    border-radius: 2px;
+    margin-top: 8px;
+    overflow: hidden;
+}
+
+.mic-level-bar {
+    height: 100%;
+    width: 0%;
+    background-color: #43b581;
+    border-radius: 2px;
+    transition: width 0.1s ease;
+}
+
+/* Remove old noise suppression button styles from user controls */
+.control-btn#noiseSuppressionBtn {
+    display: none;
+}
+
+/* Level Visualizer for Microphone Test */
+.level-visualizer {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    margin-left: 10px;
+    height: 20px;
+    vertical-align: middle;
+}
+
+.level-bar {
+    width: 3px;
+    height: 5px;
+    background-color: #43b581;
+    border-radius: 1px;
+    opacity: 0.3;
+    transition: all 0.1s ease;
+}
+
+.level-bar.active {
+    opacity: 1;
+}
+
+/* Settings Section Improvements */
+.settings-section {
+    background-color: rgba(255, 255, 255, 0.03);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.settings-section h3 {
+    margin-top: 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.settings-control {
+    margin-bottom: 16px;
+}
+
+.settings-control:last-child {
+    margin-bottom: 0;
+}
+
+/* Device Select Styling */
+.settings-select {
+    background-color: #36393f;
+    border: 1px solid #202225;
+    color: #ffffff;
+    padding: 10px 12px;
+    border-radius: 4px;
+    width: 100%;
+    font-size: 14px;
+    transition: all 0.2s;
+    cursor: pointer;
+}
+
+.settings-select:focus {
+    border-color: #5865f2;
+    box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.3);
+    outline: none;
+}
+
+.settings-select option {
+    background-color: #2f3136;
+    color: #ffffff;
+    padding: 8px;
+}
+
+/* Test Buttons */
+.test-buttons {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.test-buttons .settings-btn {
+    flex: 1;
+    padding: 10px;
+    text-align: center;
+}
+
+.test-status {
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    padding: 10px;
+    font-size: 14px;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.test-status.speaking {
+    background-color: rgba(67, 181, 129, 0.1);
+    border-left: 3px solid #43b581;
+}
+
+.test-status.playing {
+    background-color: rgba(88, 101, 242, 0.1);
+    border-left: 3px solid #5865f2;
+}
+
+/* Volume Slider Improvements */
+.volume-control {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin-top: 8px;
+}
+
+.volume-slider {
+    flex: 1;
+    height: 6px;
+    -webkit-appearance: none;
+    background: linear-gradient(to right, #5865f2 0%, #5865f2 var(--value, 50%), #4f545c var(--value, 50%), #4f545c 100%);
+    border-radius: 3px;
+    outline: none;
+}
+
+.volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #ffffff;
+    cursor: pointer;
+    border: 2px solid #5865f2;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+}
+
+.volume-slider::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #ffffff;
+    cursor: pointer;
+    border: 2px solid #5865f2;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+}
+
+/* Checkbox and Radio Improvements */
+.checkbox-control, .radio-control {
+    padding: 8px 12px;
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.03);
+    transition: background-color 0.2s;
+}
+
+.checkbox-control:hover, .radio-control:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+/* Device Labels */
+.device-label {
+    font-weight: 500;
+    color: #ffffff;
+}
+
+.device-id {
+    font-size: 11px;
+    color: #72767d;
+    font-family: monospace;
+    word-break: break-all;
+    margin-top: 2px;
+}
+
+.level-visualizer {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 10px;
+    vertical-align: middle;
+}
+
+.level-bar {
+    width: 3px;
+    height: 10px;
+    background-color: #43b581;
+    border-radius: 1px;
+    opacity: 0.3;
+    transition: all 0.1s;
+}
+
+.test-status.playing {
+    color: #43b581;
+}
+
+.test-status.speaking {
+    color: #43b581;
+}

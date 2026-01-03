@@ -1,4 +1,6 @@
-// Global state
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
 let currentChannel = 'general';
 let channels = { 'general': [], 'random': [] };
 let servers = [];
@@ -16,39 +18,591 @@ let token = null;
 let currentView = 'friends';
 let currentServerId = null;
 let currentDMUserId = null;
-let currentDMUsername = null; 
-let isCallMinimized = false; // ← ДОБАВЬТЕ ЭТУ СТРОКУ
+let currentDMUsername = null;
+let isCallMinimized = false;
 let callTimer = null;
 let callStartTime = null;
 let chatCallActive = false;
+let audioDevices = {
+    input: [],
+    output: []
+};
+let selectedAudioInput = localStorage.getItem('selectedAudioInput') || null;
+let selectedAudioOutput = localStorage.getItem('selectedAudioOutput') || null;
+let audioConstraints = {
+    echoCancellation: localStorage.getItem('echoCancellationEnabled') !== 'false',
+    autoGainControl: localStorage.getItem('autoGainControlEnabled') !== 'false',
+    noiseSuppression: false // Мы сами обрабатываем
+};
+let settingsModalOpen = false;
+let testAudioContext = null;
+let testAnalyser = null;
+let testMicrophoneStream = null;
+let audioOutputDevice = null;
 
+// Noise suppression
+let noiseSuppressionEnabled = localStorage.getItem('noiseSuppressionEnabled') !== 'false';
+let noiseSuppressor = null;
+let audioContext = null;
+let sourceNode = null;
+let destinationNode = null;
 
-// Initialize
-document.addEventListener('DOMContentLoaded', () => {
-    token = localStorage.getItem('token');
-    const userStr = localStorage.getItem('currentUser');
+// ============================================================================
+// PROFESSIONAL NOISE SUPPRESSION SYSTEM (Discord Level)
+// ============================================================================
+
+class ProfessionalNoiseSuppressor {
+    constructor() {
+        this.audioContext = null;
+        this.workletNode = null;
+        this.source = null;
+        this.destination = null;
+        this.isActive = false;
+        this.isInitialized = false;
+        
+        // Professional settings (optimized for voice)
+        this.settings = {
+            threshold: -50,       // dB - lower for more aggressive noise gate
+            ratio: 4.0,           // Compression ratio
+            attack: 0.005,        // seconds - slightly longer attack for smoothness
+            release: 0.150,       // seconds - longer release to avoid chopping
+            knee: 20,             // dB - softer knee for smoother transition
+            makeupGain: 6,        // dB - compensate for reduction
+            noiseReduction: 25,   // dB - amount of noise reduction
+            highPassFreq: 100,    // Hz - remove low rumble
+            lowPassFreq: 8000,    // Hz - remove high frequency hiss
+            preGain: 1.2,         // Pre-amplification before processing
+            postGain: 0.9,        // Post-amplification after processing
+            adaptive: true,       // Adaptive noise floor
+            smoothness: 0.95      // Smoothing factor (0-1)
+        };
+        
+        // Analysis buffers
+        this.noiseFloor = -60;
+        this.rms = 0;
+        this.voiceActivity = 0;
+        this.isSpeech = false;
+        this.speechHistory = [];
+        this.stabilityCounter = 0;
+    }
     
-    if (!token || !userStr) {
-        window.location.replace('login.html');
-        return;
+    async initialize() {
+        if (this.isInitialized) return true;
+        
+        try {
+            // Create high-quality audio context with latency optimization
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: 48000,
+                latencyHint: 'interactive',
+                echoCancellation: false, // We'll handle it ourselves
+                noiseSuppression: false  // Disable browser's noise suppression
+            });
+            
+            // Resume context (required by some browsers)
+            if (this.audioContext.state === 'suspended') {
+                await this.audioContext.resume();
+            }
+            
+            console.log('Professional noise suppressor initialized');
+            this.isInitialized = true;
+            return true;
+        } catch (error) {
+            console.error('Failed to initialize audio context:', error);
+            return false;
+        }
+    }
+    
+    async processStream(inputStream) {
+        if (!this.isInitialized) {
+            await this.initialize();
+        }
+        
+        if (this.isActive) {
+            this.disconnect();
+        }
+        
+        try {
+            // Create audio graph
+            this.source = this.audioContext.createMediaStreamSource(inputStream);
+            this.destination = this.audioContext.createMediaStreamDestination();
+            
+            // Create processing chain
+            await this.createProcessingChain();
+            
+            this.isActive = true;
+            
+            // Output stream with processed audio
+            const outputStream = this.destination.stream;
+            
+            // Preserve video tracks if any
+            inputStream.getTracks().forEach(track => {
+                if (track.kind === 'video') {
+                    outputStream.addTrack(track);
+                }
+            });
+            
+            console.log('Professional noise suppression active');
+            return outputStream;
+            
+        } catch (error) {
+            console.error('Error processing stream:', error);
+            // Fallback to raw stream if processing fails
+            return inputStream;
+        }
+    }
+    
+    async createProcessingChain() {
+        // Create nodes
+        const preGain = this.audioContext.createGain();
+        const highPass = this.audioContext.createBiquadFilter();
+        const lowPass = this.audioContext.createBiquadFilter();
+        const compressor = this.audioContext.createDynamicsCompressor();
+        const postGain = this.audioContext.createGain();
+        const analyser = this.audioContext.createAnalyser();
+        
+        // Configure nodes
+        preGain.gain.value = this.settings.preGain;
+        
+        // High-pass filter (remove rumble)
+        highPass.type = 'highpass';
+        highPass.frequency.value = this.settings.highPassFreq;
+        highPass.Q.value = 0.5; // Gentle roll-off
+        
+        // Low-pass filter (remove hiss)
+        lowPass.type = 'lowpass';
+        lowPass.frequency.value = this.settings.lowPassFreq;
+        lowPass.Q.value = 0.5; // Gentle roll-off
+        
+        // Compressor settings (aggressive for noise reduction)
+        compressor.threshold.value = this.settings.threshold;
+        compressor.knee.value = this.settings.knee;
+        compressor.ratio.value = this.settings.ratio;
+        compressor.attack.value = this.settings.attack;
+        compressor.release.value = this.settings.release;
+        
+        postGain.gain.value = this.settings.postGain;
+        
+        // Analyser for real-time analysis
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.8;
+        
+        // Create script processor for advanced noise suppression
+        const processor = this.audioContext.createScriptProcessor(2048, 1, 1);
+        
+        // Initialize analysis buffers
+        const fftSize = analyser.frequencyBinCount;
+        let noiseEstimate = new Float32Array(fftSize).fill(-80);
+        let signalEstimate = new Float32Array(fftSize).fill(-80);
+        let spectralWeights = new Float32Array(fftSize).fill(1.0);
+        
+        processor.onaudioprocess = (event) => {
+            const inputBuffer = event.inputBuffer;
+            const outputBuffer = event.outputBuffer;
+            
+            const input = inputBuffer.getChannelData(0);
+            const output = outputBuffer.getChannelData(0);
+            
+            // Calculate RMS (for voice activity detection)
+            let sum = 0;
+            for (let i = 0; i < input.length; i++) {
+                sum += input[i] * input[i];
+            }
+            const rms = Math.sqrt(sum / input.length);
+            const dB = 20 * Math.log10(Math.max(rms, 0.0001));
+            
+            // Smooth RMS value
+            this.rms = this.settings.smoothness * this.rms + (1 - this.settings.smoothness) * dB;
+            
+            // Get frequency data
+            const frequencyData = new Float32Array(fftSize);
+            analyser.getFloatFrequencyData(frequencyData);
+            
+            // Update noise floor (adaptive learning)
+            if (this.rms < this.noiseFloor + 10) {
+                // We're in a quiet period, update noise floor
+                this.noiseFloor = 0.999 * this.noiseFloor + 0.001 * this.rms;
+            }
+            
+            // Voice activity detection with hysteresis
+            const voiceThreshold = this.noiseFloor + 12; // 12dB above noise floor
+            const isCurrentSpeech = this.rms > voiceThreshold;
+            
+            // Update voice activity with smoothing
+            if (isCurrentSpeech) {
+                this.voiceActivity = Math.min(this.voiceActivity + 0.15, 1.0);
+                this.stabilityCounter = Math.min(this.stabilityCounter + 1, 10);
+            } else {
+                this.voiceActivity = Math.max(this.voiceActivity - 0.05, 0.0);
+                this.stabilityCounter = Math.max(this.stabilityCounter - 1, 0);
+            }
+            
+            // Speech is detected if we have high voice activity AND stability
+            this.isSpeech = this.voiceActivity > 0.4 && this.stabilityCounter > 3;
+            
+            // Update speech history
+            this.speechHistory.push(this.isSpeech);
+            if (this.speechHistory.length > 30) this.speechHistory.shift();
+            
+            // Spectral processing for noise reduction
+            for (let i = 0; i < fftSize; i++) {
+                const power = Math.pow(10, frequencyData[i] / 10);
+                
+                if (this.isSpeech) {
+                    // During speech: update signal estimate
+                    signalEstimate[i] = 0.98 * signalEstimate[i] + 0.02 * power;
+                } else {
+                    // During silence: update noise estimate
+                    noiseEstimate[i] = 0.995 * noiseEstimate[i] + 0.005 * power;
+                }
+                
+                // Calculate SNR for this frequency bin
+                const snr = 10 * Math.log10((signalEstimate[i] + 0.0001) / (noiseEstimate[i] + 0.0001));
+                
+                // Apply spectral subtraction with smooth curve
+                let gain = 1.0;
+                if (snr < 0) {
+                    // Below noise floor: aggressive reduction
+                    gain = 0.1;
+                } else if (snr < 15) {
+                    // In transition zone: smooth reduction
+                    gain = 0.3 + 0.7 * (snr / 15);
+                } else {
+                    // Above noise floor: full signal
+                    gain = 1.0;
+                }
+                
+                // Apply frequency-dependent weighting
+                const freq = i * this.audioContext.sampleRate / (2 * fftSize);
+                if (freq < 300 || freq > 6000) {
+                    // Reduce gain for extreme frequencies
+                    gain *= 0.7;
+                }
+                
+                spectralWeights[i] = 0.9 * spectralWeights[i] + 0.1 * gain;
+            }
+            
+            // Apply processing to time domain with overlap-add for smoothness
+            const windowSize = 512;
+            const overlap = 0.75;
+            const hopSize = windowSize * (1 - overlap);
+            
+            for (let pos = 0; pos < input.length; pos += hopSize) {
+                // Create window (Hanning)
+                const window = new Float32Array(windowSize);
+                for (let i = 0; i < windowSize && pos + i < input.length; i++) {
+                    window[i] = input[pos + i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (windowSize - 1)));
+                }
+                
+                // Apply spectral weighting (simplified)
+                const freqIndex = Math.min(Math.floor(pos / input.length * fftSize), fftSize - 1);
+                const windowGain = spectralWeights[freqIndex];
+                
+                // Apply noise gate with soft knee
+                let processedWindow = new Float32Array(windowSize);
+                for (let i = 0; i < windowSize && pos + i < input.length; i++) {
+                    let sample = window[i];
+                    
+                    // Apply adaptive noise gate
+                    if (!this.isSpeech && Math.abs(sample) < Math.pow(10, this.noiseFloor / 20) * 1.5) {
+                        sample *= 0.05; // Very aggressive reduction during silence
+                    }
+                    
+                    // Apply spectral gain
+                    sample *= windowGain;
+                    
+                    // Soft clipping to prevent distortion
+                    if (Math.abs(sample) > 0.9) {
+                        sample = Math.sign(sample) * (0.9 + 0.1 * Math.tanh((Math.abs(sample) - 0.9) * 5));
+                    }
+                    
+                    processedWindow[i] = sample;
+                    
+                    // Overlap-add to output
+                    if (pos + i < output.length) {
+                        output[pos + i] = (output[pos + i] || 0) + processedWindow[i];
+                    }
+                }
+            }
+            
+            // Normalize output to prevent clipping
+            let maxAmplitude = 0;
+            for (let i = 0; i < output.length; i++) {
+                maxAmplitude = Math.max(maxAmplitude, Math.abs(output[i]));
+            }
+            
+            if (maxAmplitude > 0.95) {
+                const scale = 0.95 / maxAmplitude;
+                for (let i = 0; i < output.length; i++) {
+                    output[i] *= scale;
+                }
+            }
+        };
+        
+        // Connect audio graph
+        this.source.connect(preGain);
+        preGain.connect(highPass);
+        highPass.connect(lowPass);
+        lowPass.connect(compressor);
+        compressor.connect(postGain);
+        postGain.connect(analyser);
+        analyser.connect(processor);
+        processor.connect(this.destination);
+        
+        // Store references for cleanup
+        this.processingNodes = {
+            preGain, highPass, lowPass, compressor,
+            postGain, analyser, processor
+        };
+    }
+    
+    disconnect() {
+        if (!this.isActive) return;
+        
+        try {
+            // Disconnect all nodes
+            if (this.processingNodes) {
+                Object.values(this.processingNodes).forEach(node => {
+                    if (node && node.disconnect) {
+                        try {
+                            node.disconnect();
+                        } catch (e) {
+                            // Ignore disconnection errors
+                        }
+                    }
+                });
+            }
+            
+            if (this.source) {
+                try {
+                    this.source.disconnect();
+                } catch (e) {}
+            }
+            
+            if (this.destination) {
+                try {
+                    this.destination.disconnect();
+                } catch (e) {}
+            }
+            
+            this.isActive = false;
+            console.log('Noise suppressor disconnected');
+        } catch (error) {
+            console.warn('Error disconnecting noise suppressor:', error);
+        }
+    }
+    
+    updateSettings(newSettings) {
+        Object.assign(this.settings, newSettings);
+        
+        if (this.isActive && this.processingNodes) {
+            // Update nodes with new settings
+            try {
+                this.processingNodes.preGain.gain.value = this.settings.preGain;
+                this.processingNodes.postGain.gain.value = this.settings.postGain;
+                
+                this.processingNodes.highPass.frequency.value = this.settings.highPassFreq;
+                this.processingNodes.lowPass.frequency.value = this.settings.lowPassFreq;
+                
+                this.processingNodes.compressor.threshold.value = this.settings.threshold;
+                this.processingNodes.compressor.ratio.value = this.settings.ratio;
+                this.processingNodes.compressor.attack.value = this.settings.attack;
+                this.processingNodes.compressor.release.value = this.settings.release;
+                this.processingNodes.compressor.knee.value = this.settings.knee;
+            } catch (error) {
+                console.warn('Error updating noise suppressor settings:', error);
+            }
+        }
+    }
+    
+    getMetrics() {
+        return {
+            noiseFloor: this.noiseFloor,
+            rms: this.rms,
+            voiceActivity: this.voiceActivity,
+            isSpeech: this.isSpeech,
+            stability: this.stabilityCounter
+        };
+    }
+    
+    destroy() {
+        this.disconnect();
+        
+        if (this.audioContext && this.audioContext.state !== 'closed') {
+            this.audioContext.close().catch(() => {});
+        }
+        
+        this.isInitialized = false;
+        this.audioContext = null;
+    }
+}
+
+// ============================================================================
+// AUDIO PROCESSING FUNCTIONS
+// ============================================================================
+
+async function applyNoiseSuppression(stream) {
+    if (!noiseSuppressionEnabled || !stream) {
+        return stream;
     }
     
     try {
-        currentUser = JSON.parse(userStr);
-        initializeApp();
-    } catch (e) {
-        console.error('Error parsing user data:', e);
-        localStorage.removeItem('token');
-        localStorage.removeItem('currentUser');
-        window.location.replace('login.html');
+        // Create or reuse noise suppressor
+        if (!noiseSuppressor) {
+            noiseSuppressor = new ProfessionalNoiseSuppressor();
+            await noiseSuppressor.initialize();
+        }
+        
+        console.log('Applying professional noise suppression...');
+        const processedStream = await noiseSuppressor.processStream(stream);
+        console.log('Noise suppression applied successfully');
+        
+        // Log metrics for debugging
+        setInterval(() => {
+            if (noiseSuppressor && noiseSuppressor.isActive) {
+                const metrics = noiseSuppressor.getMetrics();
+                console.log('Noise suppressor metrics:', {
+                    noiseFloor: metrics.noiseFloor.toFixed(1),
+                    rms: metrics.rms.toFixed(1),
+                    voiceActivity: metrics.voiceActivity.toFixed(2),
+                    isSpeech: metrics.isSpeech,
+                    stability: metrics.stability
+                });
+            }
+        }, 5000);
+        
+        return processedStream;
+    } catch (error) {
+        console.warn('Professional noise suppression failed, using raw audio:', error);
+        return stream;
     }
-});
+}
+
+function cleanupAudioProcessing() {
+    try {
+        if (noiseSuppressor) {
+            noiseSuppressor.destroy();
+            noiseSuppressor = null;
+        }
+        
+        if (audioContext && audioContext.state !== 'closed') {
+            audioContext.close().catch(() => {});
+            audioContext = null;
+        }
+        
+        sourceNode = null;
+        destinationNode = null;
+        
+        console.log('Audio processing cleaned up');
+    } catch (error) {
+        console.warn('Error cleaning up audio processing:', error);
+    }
+}
+
+async function restartAudioWithNoiseSuppression(enabled) {
+    if (!localAudioStream || !inCall) return;
+    
+    const oldStream = localAudioStream;
+    const wasMuted = isMuted;
+    
+    try {
+        // Stop old tracks gently
+        oldStream.getTracks().forEach(track => {
+            try {
+                track.stop();
+            } catch (e) {
+                // Ignore stop errors
+            }
+        });
+        
+        // Get new stream with appropriate settings
+        await ensureLocalAudio(enabled);
+        
+        // Update all peer connections with new audio track
+        const newAudioTrack = localAudioStream.getAudioTracks()[0];
+        if (newAudioTrack) {
+            Object.values(peerConnections).forEach(pc => {
+                try {
+                    const senders = pc.getSenders();
+                    senders.forEach(sender => {
+                        if (sender.track && sender.track.kind === 'audio') {
+                            sender.replaceTrack(newAudioTrack);
+                        }
+                    });
+                } catch (error) {
+                    console.warn('Error updating peer connection:', error);
+                }
+            });
+        }
+        
+        // Restore mute state
+        if (wasMuted && localAudioStream) {
+            localAudioStream.getAudioTracks().forEach(track => {
+                track.enabled = false;
+            });
+        }
+        
+        console.log(`Noise suppression ${enabled ? 'enabled' : 'disabled'} successfully`);
+        showNotification(
+            'Шумоподавление',
+            noiseSuppressionEnabled ? 'Включено (профессиональный режим)' : 'Выключено'
+        );
+        
+    } catch (error) {
+        console.error('Error restarting audio:', error);
+        // Try to restore old stream if possible
+        if (oldStream.active) {
+            localAudioStream = oldStream;
+        }
+    }
+}
+
+// ============================================================================
+// SOUND EFFECTS
+// ============================================================================
+
+function playRingSound() {
+    const sound = document.getElementById('ringSound');
+    if (sound) {
+        sound.currentTime = 0;
+        sound.volume = 0.5;
+        sound.play().catch(e => console.log('Cannot play ring sound:', e));
+    }
+}
+
+function stopRingSound() {
+    const sound = document.getElementById('ringSound');
+    if (sound) {
+        sound.pause();
+        sound.currentTime = 0;
+    }
+}
+
+function playConnectSound() {
+    const sound = document.getElementById('connectSound');
+    if (sound) {
+        sound.currentTime = 0;
+        sound.volume = 0.3;
+        sound.play().catch(e => console.log('Cannot play connect sound:', e));
+    }
+}
+
+function playDisconnectSound() {
+    const sound = document.getElementById('disconnectSound');
+    if (sound) {
+        sound.currentTime = 0;
+        sound.volume = 0.3;
+        sound.play().catch(e => console.log('Cannot play disconnect sound:', e));
+    }
+}
+
+// ============================================================================
+// CALL MANAGEMENT
+// ============================================================================
 
 function showChatCall(friendUsername, status = "Calling...") {
     const chatCallInterface = document.getElementById('chatCallInterface');
     chatCallInterface.classList.remove('hidden');
     
-    // Обновляем информацию о звонке
     const remoteAvatar = document.getElementById('remoteCallAvatar');
     const remoteName = document.getElementById('remoteCallName');
     const remoteStatus = document.getElementById('remoteCallStatus');
@@ -61,34 +615,26 @@ function showChatCall(friendUsername, status = "Calling...") {
         callStatusText.innerHTML = `<span>${status}</span>`;
     }
     
-    // Запускаем таймер если звонок принят
     if (status === "Connected") {
         startCallTimer();
     }
     
-    // Добавляем сообщение в чат
     addCallStartedMessage(friendUsername);
-    
     chatCallActive = true;
 }
 
-// Функция для скрытия звонка в чате
 function hideChatCall() {
     const chatCallInterface = document.getElementById('chatCallInterface');
     chatCallInterface.classList.add('hidden');
     
-    // Останавливаем демонстрацию экрана если активна
     if (screenStream) {
         stopScreenShare();
     }
     
-    // Останавливаем таймер
     stopCallTimer();
-    
     chatCallActive = false;
 }
 
-// Таймер звонка
 function startCallTimer() {
     callStartTime = Date.now();
     updateCallTimerDisplay();
@@ -112,20 +658,12 @@ function updateCallTimerDisplay() {
     const minutes = Math.floor(elapsed / 60).toString().padStart(2, '0');
     const seconds = (elapsed % 60).toString().padStart(2, '0');
     
-    // Обновляем таймер в чат-интерфейсе
     const chatTimerElement = document.getElementById('chatCallTimer');
     if (chatTimerElement) {
         chatTimerElement.textContent = `${minutes}:${seconds}`;
     }
-    
-    // Также обновляем старый таймер если есть
-    const timerElement = document.querySelector('.call-timer');
-    if (timerElement) {
-        timerElement.textContent = `${minutes}:${seconds}`;
-    }
 }
 
-// Добавление сообщения о начале звонка
 function addCallStartedMessage(friendUsername) {
     const messagesContainer = document.getElementById('messagesContainer');
     
@@ -142,7 +680,6 @@ function addCallStartedMessage(friendUsername) {
     scrollToBottom();
 }
 
-// Добавление сообщения о завершении звонка
 function addCallEndedMessage(friendUsername) {
     const messagesContainer = document.getElementById('messagesContainer');
     
@@ -157,7 +694,6 @@ function addCallEndedMessage(friendUsername) {
     
     messagesContainer.appendChild(callMessage);
     
-    // Обновляем длительность
     if (callStartTime) {
         const duration = Math.floor((Date.now() - callStartTime) / 1000);
         const minutes = Math.floor(duration / 60).toString().padStart(2, '0');
@@ -168,7 +704,320 @@ function addCallEndedMessage(friendUsername) {
     scrollToBottom();
 }
 
-// Инициализация контролов чат-звонка
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+document.addEventListener('DOMContentLoaded', () => {
+    token = localStorage.getItem('token');
+    const userStr = localStorage.getItem('currentUser');
+    
+    if (!token || !userStr) {
+        window.location.replace('login.html');
+        return;
+    }
+    
+    try {
+        currentUser = JSON.parse(userStr);
+        initializeApp();
+    } catch (e) {
+        console.error('Error parsing user data:', e);
+        localStorage.removeItem('token');
+        localStorage.removeItem('currentUser');
+        window.location.replace('login.html');
+    }
+});
+
+function initializeApp() {
+    updateUserInfo();
+    initializeFriendsTabs();
+    initializeChannels();
+    initializeMessageInput();
+    initializeUserControls();
+    initializeCallControls();
+    initializeServerManagement();
+    initializeFileUpload();
+    initializeEmojiPicker();
+    initializeDraggableCallWindow();
+    connectToSocketIO();
+    requestNotificationPermission();
+    loadUserServers();
+    showFriendsView();
+    initializeCallFriendButton();
+    initializeChatCallControls();
+    
+    // Инициализация настроек ДО загрузки настроек
+    initializeSettingsModal();
+    
+    // Загрузка настроек и применение их
+    loadSettings();
+    applyOutputVolume();
+    
+    // Загрузка списка устройств
+    setTimeout(() => {
+        loadAudioDevices();
+    }, 1000);
+    
+    // Инициализация шумоподавления
+    if (noiseSuppressionEnabled) {
+        noiseSuppressor = new ProfessionalNoiseSuppressor();
+    }
+    
+    console.log('Discord Clone инициализирован!');
+    if (currentUser) {
+        console.log('Вход выполнен как:', currentUser.username);
+    }
+}
+
+// Создание тестового аудио элемента
+function createTestSoundElement() {
+    // Теперь генерируем звук на лету, так что ничего не создаем
+    console.log('Тестовый звук будет генерироваться динамически');
+}
+
+// ============================================================================
+// AUDIO MANAGEMENT
+// ============================================================================
+
+async function ensureLocalAudio(useNoiseSuppression = true) {
+    // Если у нас есть валидный поток, переиспользуем его
+    if (localAudioStream) {
+        const activeTracks = localAudioStream.getTracks().filter(track => 
+            track.readyState === 'live' && track.enabled !== false
+        );
+        if (activeTracks.length > 0) {
+            return localAudioStream;
+        }
+    }
+
+    try {
+        // Загрузка сохраненных настроек
+        const savedInput = selectedAudioInput || localStorage.getItem('selectedAudioInput');
+        const savedEchoCancellation = localStorage.getItem('echoCancellationEnabled') !== 'false';
+        const savedAutoGainControl = localStorage.getItem('autoGainControlEnabled') !== 'false';
+        
+        // Параметры с учетом настроек
+        const constraints = {
+            audio: {
+                deviceId: savedInput ? { exact: savedInput } : undefined,
+                echoCancellation: { ideal: savedEchoCancellation },
+                noiseSuppression: { ideal: false }, // Мы сами обрабатываем шумоподавление
+                autoGainControl: { ideal: savedAutoGainControl },
+                sampleRate: 48000,
+                channelCount: 1,
+                sampleSize: 16,
+                latency: 0.01
+            },
+            video: false
+        };
+
+        console.log('Запрашиваю микрофон с настройками:', constraints.audio);
+
+        let stream;
+        
+        try {
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            console.log('Доступ к микрофону получен. Устройство:', 
+                stream.getAudioTracks()[0]?.label || 'Неизвестно');
+        } catch (highQualityError) {
+            console.warn('Высококачественное аудио недоступно, используем базовое:', highQualityError);
+            // Fallback к базовому аудио
+            const fallbackConstraints = {
+                audio: {
+                    deviceId: savedInput ? { exact: savedInput } : undefined,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false
+                },
+                video: false
+            };
+            stream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
+            console.log('Базовый доступ к микрофону получен');
+        }
+
+        // Применение шумоподавления если включено
+        if (useNoiseSuppression && noiseSuppressionEnabled) {
+            try {
+                localAudioStream = await applyNoiseSuppression(stream);
+            } catch (suppressionError) {
+                console.warn('Шумоподавление не сработало, используем исходный поток:', suppressionError);
+                localAudioStream = stream;
+            }
+        } else {
+            localAudioStream = stream;
+        }
+
+        // Установка начального состояния mute
+        if (isMuted && localAudioStream) {
+            localAudioStream.getAudioTracks().forEach(track => {
+                track.enabled = false;
+            });
+        }
+
+        // Применение громкости микрофона из настроек
+        const inputVolume = localStorage.getItem('inputVolume') || 100;
+        applyInputVolume(parseInt(inputVolume) / 100);
+
+        return localAudioStream;
+    } catch (err) {
+        console.error("Ошибка получения микрофона:", err);
+        
+        // Показать понятное сообщение об ошибке
+        if (err.name === 'NotAllowedError') {
+            alert("Микрофон заблокирован. Пожалуйста, разрешите доступ к микрофону в настройках браузера.");
+        } else if (err.name === 'NotFoundError') {
+            alert("Микрофон не найден. Убедитесь, что микрофон подключен и включен.");
+        } else if (err.name === 'OverconstrainedError') {
+            alert("Запрошенные параметры микрофона недоступны. Попробуйте выбрать другое устройство.");
+        } else {
+            alert("Не удалось получить доступ к микрофону. Ошибка: " + err.message);
+        }
+        
+        throw err;
+    }
+}
+
+function applyInputVolume(volume) {
+    if (!localAudioStream) return;
+    
+    const tracks = localAudioStream.getAudioTracks();
+    if (tracks.length > 0) {
+        console.log('Установка громкости микрофона:', volume);
+    }
+}
+
+// ============================================================================
+// UI CONTROLS
+// ============================================================================
+
+function updateNoiseSuppressionButton() {
+    const btn = document.getElementById('noiseSuppressionBtn');
+    if (!btn) return;
+    
+    const normalIcon = btn.querySelector('.icon-normal');
+    const slashedIcon = btn.querySelector('.icon-slashed');
+    
+    if (normalIcon && slashedIcon) {
+        normalIcon.style.display = noiseSuppressionEnabled ? 'block' : 'none';
+        slashedIcon.style.display = noiseSuppressionEnabled ? 'none' : 'block';
+    }
+    
+    btn.title = noiseSuppressionEnabled ? 
+        'Шумоподавление: ВКЛЮЧЕНО (Профессиональный режим)' : 
+        'Шумоподавление: ВЫКЛЮЧЕНО';
+    
+    // Update button state
+    btn.classList.toggle('active', noiseSuppressionEnabled);
+}
+
+function initializeUserControls() {
+    const muteBtn = document.getElementById('muteBtn');
+    const deafenBtn = document.getElementById('deafenBtn');
+    const settingsBtn = document.getElementById('settingsBtn');
+    const noiseSuppressionBtn = document.getElementById('noiseSuppressionBtn');
+    
+    // Mute button
+    muteBtn.addEventListener('click', () => {
+        isMuted = !isMuted;
+        const normalIcon = muteBtn.querySelector('.icon-normal');
+        const slashedIcon = muteBtn.querySelector('.icon-slashed');
+        
+        if (normalIcon && slashedIcon) {
+            normalIcon.style.display = isMuted ? 'none' : 'block';
+            slashedIcon.style.display = isMuted ? 'block' : 'none';
+        }
+        
+        muteBtn.classList.toggle('active', isMuted);
+        
+        if (localAudioStream) {
+            localAudioStream.getAudioTracks().forEach(track => {
+                track.enabled = !isMuted;
+            });
+        }
+        
+        // Update call buttons
+        updateCallButtons();
+    });
+    
+    // Deafen button
+    deafenBtn.addEventListener('click', () => {
+        isDeafened = !isDeafened;
+        const normalIcon = deafenBtn.querySelector('.icon-normal');
+        const slashedIcon = deafenBtn.querySelector('.icon-slashed');
+        
+        if (normalIcon && slashedIcon) {
+            normalIcon.style.display = isDeafened ? 'none' : 'block';
+            slashedIcon.style.display = isDeafened ? 'block' : 'none';
+        }
+        
+        deafenBtn.classList.toggle('active', isDeafened);
+        
+        if (isDeafened) {
+            // Mute microphone when deafened
+            if (!isMuted) {
+                isMuted = true;
+                muteBtn.querySelector('.icon-normal').style.display = 'none';
+                muteBtn.querySelector('.icon-slashed').style.display = 'block';
+                muteBtn.classList.add('active');
+                
+                if (localAudioStream) {
+                    localAudioStream.getAudioTracks().forEach(track => {
+                        track.enabled = false;
+                    });
+                }
+            }
+            
+            // Mute all remote audio
+            document.querySelectorAll('.audio-element').forEach(audio => {
+                audio.volume = 0;
+                audio.muted = true;
+            });
+        } else {
+            // Unmute remote audio
+            document.querySelectorAll('.audio-element').forEach(audio => {
+                audio.volume = 1;
+                audio.muted = false;
+            });
+            
+            // Restore microphone state
+            if (localAudioStream) {
+                localAudioStream.getAudioTracks().forEach(track => {
+                    track.enabled = !isMuted;
+                });
+            }
+        }
+        
+        updateCallButtons();
+    });
+    
+    // Noise suppression button (теперь скрыта - управление в настройках)
+    if (noiseSuppressionBtn) {
+        noiseSuppressionBtn.style.display = 'none'; // Скрываем кнопку, так как управление в настройках
+    }
+    
+    // Settings button - открывает модальное окно настроек
+    settingsBtn.addEventListener('click', () => {
+        if (typeof openSettingsModal === 'function') {
+            openSettingsModal();
+        } else {
+            console.error('Модальное окно настроек не инициализировано');
+        }
+    });
+}
+
+function initializeCallFriendButton() {
+    const callFriendBtn = document.getElementById('callFriendBtn');
+    if (callFriendBtn) {
+        callFriendBtn.addEventListener('click', () => {
+            if (currentDMUserId && currentDMUsername) {
+                initiateCall(currentDMUserId);
+            } else {
+                alert('Выберите друга для звонка');
+            }
+        });
+    }
+}
+
 function initializeChatCallControls() {
     const chatToggleAudioBtn = document.getElementById('chatToggleAudioBtn');
     const chatToggleScreenBtn = document.getElementById('chatToggleScreenBtn');
@@ -195,7 +1044,6 @@ function initializeChatCallControls() {
     }
 }
 
-// Управление аудио в чат-звонке
 function toggleChatAudio() {
     if (!localAudioStream) return;
     
@@ -204,49 +1052,47 @@ function toggleChatAudio() {
         track.enabled = isAudioEnabled;
     });
     
+    isMuted = !isAudioEnabled;
+    updateCallButtons();
+    
     const chatToggleAudioBtn = document.getElementById('chatToggleAudioBtn');
     if (chatToggleAudioBtn) {
         chatToggleAudioBtn.classList.toggle('active', !isAudioEnabled);
     }
     
-    // Также обновляем кнопку в обычном интерфейсе
     document.getElementById('toggleAudioBtn')?.classList.toggle('active', !isAudioEnabled);
 }
 
-// Завершение чат-звонка
 function endChatCall() {
-    // Останавливаем демонстрацию экрана если активна
+    stopRingSound();
+    playDisconnectSound();
+    
     if (screenStream) {
         stopScreenShare();
     }
     
-    // Остальной код остаётся прежним...
-    // Отправляем событие завершения звонка
     if (socket && socket.connected) {
         Object.keys(peerConnections).forEach(socketId => {
             socket.emit('end-call', { to: socketId });
         });
     }
     
-    // Закрываем все peer connections
     Object.values(peerConnections).forEach(pc => pc.close());
     peerConnections = {};
     
-    // Останавливаем медиа потоки
     if (localAudioStream) {
         localAudioStream.getTracks().forEach(track => track.stop());
         localAudioStream = null;
     }
     
-    // Добавляем сообщение о завершении
+    cleanupAudioProcessing();
+    
     if (currentDMUsername) {
         addCallEndedMessage(currentDMUsername);
     }
     
-    // Скрываем интерфейс звонка
     hideChatCall();
     
-    // Скрываем плавающее окно звонка (если оно есть)
     const callInterface = document.getElementById('callInterface');
     if (callInterface) {
         callInterface.classList.add('hidden');
@@ -254,105 +1100,34 @@ function endChatCall() {
     
     inCall = false;
     chatCallActive = false;
+    isAudioEnabled = true;
+    isMuted = false;
+    updateCallButtons();
 }
 
-function initializeApp() {
-    updateUserInfo();
-    initializeFriendsTabs();
-    initializeChannels();
-    initializeMessageInput();
-    initializeUserControls();
-    initializeCallControls();
-    initializeServerManagement();
-    initializeFileUpload();
-    initializeEmojiPicker();
-    initializeDraggableCallWindow();
-    connectToSocketIO();
-    requestNotificationPermission();
-    loadUserServers();
-    showFriendsView();
-	initializeCallFriendButton();
-	initializeChatCallControls();	
-}
-
-async function ensureLocalAudio() {
-    if (localAudioStream) {
-        // Проверяем, активен ли еще поток
-        const activeTracks = localAudioStream.getTracks().filter(track => track.readyState === 'live');
-        if (activeTracks.length > 0) {
-            return localAudioStream;
-        }
-    }
-
-    try {
-        localAudioStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
-            },
-            video: false
-        });
-
-        console.log('Microphone access granted, stream created:', localAudioStream.id);
-        return localAudioStream;
-    } catch (err) {
-        console.error("Не удалось получить микрофон:", err);
-        alert("Не удалось получить доступ к микрофону. Проверьте разрешения.");
-        throw err;
-    }
-}
-
-function initializeCallFriendButton() {
-    const callFriendBtn = document.getElementById('callFriendBtn');
-    if (callFriendBtn) {
-        callFriendBtn.addEventListener('click', () => {
-            if (currentDMUserId && currentDMUsername) {
-                console.log('Calling friend:', currentDMUserId, currentDMUsername);
-                initiateCall(currentDMUserId);
-            } else {
-                alert('Please select a friend to call first');
-            }
-        });
-    }
-}
-
-function requestNotificationPermission() {
-    if ('Notification' in window && Notification.permission === 'default') {
-        Notification.requestPermission();
-    }
-}
-
-function showNotification(title, body) {
-    if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification(title, { body, icon: '/assets/icon.png' });
-    }
-}
-
-function updateUserInfo() {
-    const userAvatar = document.querySelector('.user-avatar');
-    const username = document.querySelector('.username');
-    
-    if (userAvatar) userAvatar.textContent = currentUser.avatar;
-    if (username) username.textContent = currentUser.username;
-}
+// ============================================================================
+// SOCKET.IO CONNECTION
+// ============================================================================
 
 function connectToSocketIO() {
     if (typeof io !== 'undefined') {
-        socket = io({ auth: { token: token } });
-        
-        socket.on('connect', () => {
-            console.log('Connected to server');
+        socket = io({
+            auth: { token: token },
+            transports: ['websocket', 'polling']
         });
         
-       socket.on('connect_error', (error) => {
-           console.error('Connection error:', error);
-           if (error.message === 'Authentication error') {
-               localStorage.removeItem('token');
-               localStorage.removeItem('currentUser');
-               window.location.replace('login.html');
-           }
-       });
+        socket.on('connect', () => {
+            console.log('Connected to server with ID:', socket.id);
+        });
+        
+        socket.on('connect_error', (error) => {
+            console.error('Connection error:', error);
+            if (error.message === 'Authentication error') {
+                localStorage.removeItem('token');
+                localStorage.removeItem('currentUser');
+                window.location.replace('login.html');
+            }
+        });
         
         socket.on('new-message', (data) => {
             const channelId = data.channelId;
@@ -398,22 +1173,20 @@ function connectToSocketIO() {
         });
 
         socket.on('offer', async (data) => {
-			console.log('Received offer (possible renegotiation) from:', data.from);
-			if (!peerConnections[data.from]) {
-				await createPeerConnection(data.from, false);
-			}
-			const pc = peerConnections[data.from];
-			try {
-				await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-				console.log('Remote description set (renegotiation)');
-				const answer = await pc.createAnswer();
-				await pc.setLocalDescription(answer);
-				socket.emit('answer', { to: data.from, answer: answer });
-				console.log('Answer sent (renegotiation)');
-			} catch (error) {
-				console.error('Error handling offer (renegotiation):', error);
-			}
-		});
+            console.log('Received offer from:', data.from);
+            if (!peerConnections[data.from]) {
+                await createPeerConnection(data.from, false);
+            }
+            const pc = peerConnections[data.from];
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit('answer', { to: data.from, answer: answer });
+            } catch (error) {
+                console.error('Error handling offer:', error);
+            }
+        });
 
         socket.on('answer', async (data) => {
             console.log('Received answer from:', data.from);
@@ -421,7 +1194,6 @@ function connectToSocketIO() {
             if (pc) {
                 try {
                     await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-                    console.log('Answer processed successfully');
                 } catch (error) {
                     console.error('Error setting remote description:', error);
                 }
@@ -434,7 +1206,6 @@ function connectToSocketIO() {
             if (pc && data.candidate) {
                 try {
                     await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                    console.log('ICE candidate added');
                 } catch (error) {
                     console.error('Error adding ICE candidate:', error);
                 }
@@ -479,22 +1250,26 @@ function connectToSocketIO() {
             }
         });
 
-		socket.on('call-accepted', (data) => {
-			console.log('Call accepted by:', data.from);
-			
-			// Обновляем статус звонка на "Connected"
-			document.getElementById('remoteCallStatus').textContent = 'Connected';
-			document.getElementById('callStatusText').innerHTML = `<span>Connected</span>`;
-			
-			// Запускаем таймер
-			startCallTimer();
-			
-			if (!peerConnections[data.from.socketId]) {
-				createPeerConnection(data.from.socketId, true);
-			}
-		});
+        socket.on('call-accepted', (data) => {
+            console.log('Call accepted by:', data.from);
+            
+            stopRingSound();
+            playConnectSound();
+            
+            document.getElementById('remoteCallStatus').textContent = 'Connected';
+            document.getElementById('callStatusText').innerHTML = `<span>Connected</span>`;
+            
+            startCallTimer();
+            
+            if (!peerConnections[data.from.socketId]) {
+                createPeerConnection(data.from.socketId, true);
+            }
+        });
 
         socket.on('call-rejected', (data) => {
+            stopRingSound();
+            playDisconnectSound();
+            
             alert('Call was declined');
             const callInterface = document.getElementById('callInterface');
             callInterface.classList.add('hidden');
@@ -506,6 +1281,8 @@ function connectToSocketIO() {
         });
         
         socket.on('call-ended', (data) => {
+            playDisconnectSound();
+            
             console.log('Call ended by:', data.from);
             if (peerConnections[data.from]) {
                 peerConnections[data.from].close();
@@ -520,7 +1297,10 @@ function connectToSocketIO() {
     }
 }
 
-// Initialize friends tabs
+// ============================================================================
+// FRIENDS SYSTEM
+// ============================================================================
+
 function initializeFriendsTabs() {
     const tabs = document.querySelectorAll('.friends-tab');
     tabs.forEach(tab => {
@@ -609,13 +1389,11 @@ function createFriendItem(friend) {
         </div>
         <div class="friend-actions">
             <button class="friend-action-btn message" title="Message">💬</button>
-            <!-- УБРАТЬ ЭТУ КНОПКУ: <button class="friend-action-btn audio-call" title="Audio Call">📞</button> -->
             <button class="friend-action-btn remove" title="Remove">🗑️</button>
         </div>
     `;
 
     div.querySelector('.message').addEventListener('click', () => startDM(friend.id, friend.username));
-    // УБРАТЬ ЭТУ СТРОКУ: div.querySelector('.audio-call').addEventListener('click', () => initiateCall(friend.id));
     div.querySelector('.remove').addEventListener('click', () => removeFriend(friend.id));
     
     return div;
@@ -786,11 +1564,16 @@ window.removeFriend = async function(friendId) {
     }
 };
 
+// ============================================================================
+// CALL INITIATION
+// ============================================================================
+
 async function initiateCall(friendId) {
     try {
-        await ensureLocalAudio();
+        // Get microphone with noise suppression
+        await ensureLocalAudio(noiseSuppressionEnabled);
 
-        // Показываем интерфейс звонка в чате
+        // Show chat call interface
         if (currentDMUsername) {
             showChatCall(currentDMUsername);
         }
@@ -812,19 +1595,24 @@ async function initiateCall(friendId) {
             });
         }
 
+        playRingSound();
+
         inCall = true;
         chatCallActive = true;
         isAudioEnabled = true;
+        isMuted = false;
         updateCallButtons();
+
+        console.log(`Initiating call to ${friendId}`);
 
     } catch (error) {
         console.error('Error initiating call:', error);
-        alert('Не удалось получить доступ к микрофону. Проверьте разрешения.');
+        alert('Не удалось получить доступ к микрофону.');
+        stopRingSound();
         hideChatCall();
     }
 }
 
-// Show incoming call notification
 function showIncomingCall(caller, type) {
     const incomingCallDiv = document.getElementById('incomingCall');
     const callerName = incomingCallDiv.querySelector('.caller-name');
@@ -835,7 +1623,8 @@ function showIncomingCall(caller, type) {
     
     incomingCallDiv.classList.remove('hidden');
     
-    // Set up accept/reject handlers
+    playRingSound();
+    
     const acceptBtn = document.getElementById('acceptCallBtn');
     const rejectBtn = document.getElementById('rejectCallBtn');
     
@@ -849,21 +1638,21 @@ function showIncomingCall(caller, type) {
         rejectCall(caller);
     };
     
-    // Auto-reject after 30 seconds
     setTimeout(() => {
         if (!incomingCallDiv.classList.contains('hidden')) {
             incomingCallDiv.classList.add('hidden');
             rejectCall(caller);
         }
-    }, 30000);
+    }, 300000);
 }
 
-// Accept incoming call
 async function acceptCall(caller) {
     try {
-        await ensureLocalAudio();
+        await ensureLocalAudio(noiseSuppressionEnabled);
 
-        // Показываем интерфейс звонка в чате
+        stopRingSound();
+        playConnectSound();
+
         showChatCall(caller.username);
 
         window.currentCallDetails = {
@@ -885,6 +1674,7 @@ async function acceptCall(caller) {
         inCall = true;
         chatCallActive = true;
         isAudioEnabled = true;
+        isMuted = false;
         updateCallButtons();
 
         if (!peerConnections[caller.socketId]) {
@@ -893,22 +1683,29 @@ async function acceptCall(caller) {
 
     } catch (error) {
         console.error('Error accepting call:', error);
-        alert('Не удалось принять звонок. Проверьте доступ к микрофону.');
+        alert('Не удалось принять звонок.');
+        stopRingSound();
         hideChatCall();
     }
 }
 
-// Reject incoming call
 function rejectCall(caller) {
+    stopRingSound();
+    playDisconnectSound();
+    
     if (socket && socket.connected) {
         socket.emit('reject-call', { to: caller.socketId });
     }
 }
 
+// ============================================================================
+// DM AND VIEW MANAGEMENT
+// ============================================================================
+
 window.startDM = async function(friendId, friendUsername) {
     currentView = 'dm';
     currentDMUserId = friendId;
-    currentDMUsername = friendUsername; // <-- СОХРАНЯЕМ ИМЯ
+    currentDMUsername = friendUsername;
     currentServerId = null;
 
     document.getElementById('friendsView').style.display = 'none';
@@ -916,7 +1713,6 @@ window.startDM = async function(friendId, friendUsername) {
     document.getElementById('channelsView').style.display = 'none';
     document.getElementById('dmListView').style.display = 'block';
 
-    // ПОКАЗЫВАЕМ кнопку звонка
     document.getElementById('callFriendBtn').style.display = 'flex';
     
     const chatHeaderInfo = document.getElementById('chatHeaderInfo');
@@ -930,11 +1726,10 @@ window.startDM = async function(friendId, friendUsername) {
     await loadDMHistory(friendId);
 };
 
-// Show friends view
 function showFriendsView() {
     currentView = 'friends';
     currentDMUserId = null;
-    currentDMUsername = null; // <-- СБРАСЫВАЕМ ИМЯ
+    currentDMUsername = null;
 
     document.getElementById('friendsView').style.display = 'flex';
     document.getElementById('chatView').style.display = 'none';
@@ -943,36 +1738,35 @@ function showFriendsView() {
     
     document.getElementById('serverName').textContent = 'Friends';
     
-    // СКРЫВАЕМ кнопку звонка
     document.getElementById('callFriendBtn').style.display = 'none';
     
     document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
     document.getElementById('friendsBtn').classList.add('active');
     
-    // Hide chat and show friends content
     document.getElementById('chatView').style.display = 'none';
     document.getElementById('friendsView').style.display = 'flex';
 }
 
-// Show server view
 function showServerView(server) {
     currentView = 'server';
     currentServerId = server.id;
     currentDMUserId = null;
-    currentDMUsername = null; // <-- СБРАСЫВАЕМ ИМЯ
+    currentDMUsername = null;
 
     document.getElementById('friendsView').style.display = 'none';
     document.getElementById('chatView').style.display = 'flex';
     document.getElementById('channelsView').style.display = 'block';
     document.getElementById('dmListView').style.display = 'none';
 
-    // СКРЫВАЕМ кнопку звонка (в серверах она не нужна)
     document.getElementById('callFriendBtn').style.display = 'none';
     
     document.getElementById('serverName').textContent = server.name;
     switchChannel('general');
 }
 
+// ============================================================================
+// SERVER MANAGEMENT
+// ============================================================================
 
 async function loadUserServers() {
     try {
@@ -1048,6 +1842,10 @@ function addServerToUI(server, switchTo = false) {
     }
 }
 
+// ============================================================================
+// CHANNEL MANAGEMENT
+// ============================================================================
+
 function initializeChannels() {
     const channelElements = document.querySelectorAll('.channel');
     
@@ -1082,7 +1880,6 @@ async function loadChannelMessages(channelName) {
     const messagesContainer = document.getElementById('messagesContainer');
     messagesContainer.innerHTML = '';
 
-    // For now, we'll use a hardcoded channel ID. This needs to be improved.
     const channelId = channelName === 'general' ? 1 : 2;
 
     try {
@@ -1109,6 +1906,10 @@ async function loadChannelMessages(channelName) {
 
     scrollToBottom();
 }
+
+// ============================================================================
+// MESSAGING
+// ============================================================================
 
 function initializeMessageInput() {
     const messageInput = document.getElementById('messageInput');
@@ -1180,14 +1981,13 @@ function addMessageToUI(message) {
     
     const reactionsContainer = document.createElement('div');
     reactionsContainer.className = 'message-reactions';
-    reactionsContainer.style.display = 'none'; // Скрываем реакции по умолчанию
+    reactionsContainer.style.display = 'none';
     
     const messageActions = document.createElement('div');
     messageActions.className = 'message-actions';
-    messageActions.style.opacity = '0'; // Скрываем действия по умолчанию
+    messageActions.style.opacity = '0';
     messageActions.style.transition = 'opacity 0.2s';
     
-    // Кнопка добавления реакции
     const addReactionBtn = document.createElement('button');
     addReactionBtn.className = 'message-action-btn reaction-btn';
     addReactionBtn.innerHTML = '😊';
@@ -1208,7 +2008,6 @@ function addMessageToUI(message) {
     
     messagesContainer.appendChild(messageGroup);
     
-    // Показываем действия при наведении на сообщение
     messageGroup.addEventListener('mouseenter', () => {
         messageActions.style.opacity = '1';
     });
@@ -1217,7 +2016,6 @@ function addMessageToUI(message) {
         messageActions.style.opacity = '0';
     });
     
-    // Показываем реакции при клике на сообщение
     messageGroup.addEventListener('click', (e) => {
         if (!e.target.closest('.message-actions') && !e.target.closest('.emoji-picker')) {
             reactionsContainer.style.display = reactionsContainer.style.display === 'none' ? 'flex' : 'none';
@@ -1237,7 +2035,10 @@ function scrollToBottom() {
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
 
-// Emoji picker
+// ============================================================================
+// EMOJI AND REACTIONS
+// ============================================================================
+
 function initializeEmojiPicker() {
     const emojiBtn = document.querySelector('.emoji-btn');
     if (emojiBtn) {
@@ -1325,7 +2126,10 @@ function updateMessageReactions(messageId, reactions) {
     });
 }
 
-// File upload
+// ============================================================================
+// FILE UPLOAD
+// ============================================================================
+
 function initializeFileUpload() {
     const attachBtn = document.querySelector('.attach-btn');
     const fileInput = document.createElement('input');
@@ -1387,68 +2191,10 @@ async function uploadFile(file) {
     }
 }
 
-// User controls
-function initializeUserControls() {
-    const muteBtn = document.getElementById('muteBtn');
-    const deafenBtn = document.getElementById('deafenBtn');
-    const settingsBtn = document.getElementById('settingsBtn');
-    
-    muteBtn.addEventListener('click', () => {
-        isMuted = !isMuted;
-        muteBtn.querySelector('.icon-normal').style.display = isMuted ? 'none' : 'block';
-        muteBtn.querySelector('.icon-slashed').style.display = isMuted ? 'block' : 'none';
-        
-        if (localAudioStream) {
-            localAudioStream.getAudioTracks().forEach(track => {
-                track.enabled = !isMuted;
-            });
-        }
-    });
-    
-    deafenBtn.addEventListener('click', () => {
-        isDeafened = !isDeafened;
-        deafenBtn.querySelector('.icon-normal').style.display = isDeafened ? 'none' : 'block';
-        deafenBtn.querySelector('.icon-slashed').style.display = isDeafened ? 'block' : 'none';
-        
-        // When deafened, also mute microphone
-        if (isDeafened) {
-            if (!isMuted) {
-                isMuted = true;
-                muteBtn.querySelector('.icon-normal').style.display = 'none';
-                muteBtn.querySelector('.icon-slashed').style.display = 'block';
-            }
-            
-            // Mute all remote audio
-            document.querySelectorAll('.audio-element').forEach(audio => {
-                audio.volume = 0;
-            });
-        } else {
-            // Unmute remote audio
-            document.querySelectorAll('.audio-element').forEach(audio => {
-                audio.volume = 1;
-            });
-        }
+// ============================================================================
+// VOICE CHANNEL
+// ============================================================================
 
-        // Update local stream audio tracks
-        if (localAudioStream) {
-            localAudioStream.getAudioTracks().forEach(track => {
-                track.enabled = !isMuted;
-            });
-        }
-    });
-    
-    settingsBtn.addEventListener('click', () => {
-        if (confirm('Do you want to logout?')) {
-            if (inCall) leaveVoiceChannel();
-            localStorage.removeItem('token');
-            localStorage.removeItem('currentUser');
-            if (socket) socket.disconnect();
-            window.location.replace('login.html');
-        }
-    });
-}
-
-// Voice channel functions
 async function joinVoiceChannel(channelName) {
     if (inCall) {
         const callInterface = document.getElementById('callInterface');
@@ -1470,22 +2216,43 @@ async function joinVoiceChannel(channelName) {
     document.querySelector('.call-channel-name').textContent = channelName;
     
     try {
-        await ensureLocalAudio();
+        await ensureLocalAudio(noiseSuppressionEnabled);
         
-        // Connect to the socket for voice
+        const remoteParticipants = document.getElementById('remoteParticipants');
+        remoteParticipants.innerHTML = '';
+        
+        const localParticipant = document.createElement('div');
+        localParticipant.className = 'participant';
+        localParticipant.id = 'participant-local';
+        localParticipant.innerHTML = `
+            <div class="participant-avatar">${currentUser.avatar || 'U'}</div>
+            <div class="participant-info">
+                <div class="participant-name">${currentUser.username} (You)</div>
+                <div class="participant-status">Connected</div>
+            </div>
+        `;
+        remoteParticipants.appendChild(localParticipant);
+        
         if (socket && socket.connected) {
-            socket.emit('join-voice-channel', { channelName, userId: currentUser.id });
+            socket.emit('join-voice-channel', { 
+                channelName, 
+                userId: currentUser.id 
+            });
         }
 
+        updateCallButtons();
+
+        console.log(`Joined voice channel: ${channelName}`);
+
     } catch (error) {
-        console.error('Error initializing media:', error);
+        console.error('Error initializing media for voice channel:', error);
         alert('Error accessing microphone. Please grant permissions.');
-        leaveVoiceChannel(true); // Force leave
+        leaveVoiceChannel(true);
     }
 }
 
 function leaveVoiceChannel(force = false) {
-    if (!inCall) return;
+    if (!inCall && !force) return;
 
     if (force) {
         inCall = false;
@@ -1498,8 +2265,11 @@ function leaveVoiceChannel(force = false) {
         if (screenStream) {
             screenStream.getTracks().forEach(track => track.stop());
             screenStream = null;
+            isScreenSharing = false;
         }
-        
+
+        cleanupAudioProcessing();
+
         if (socket && socket.connected) {
             socket.emit('leave-voice-channel', currentChannel);
         }
@@ -1507,16 +2277,61 @@ function leaveVoiceChannel(force = false) {
         Object.values(peerConnections).forEach(pc => pc.close());
         peerConnections = {};
 
-        document.querySelectorAll('.voice-channel').forEach(ch => ch.classList.remove('in-call'));
-        document.getElementById('remoteParticipants').innerHTML = '';
+        const remoteParticipants = document.getElementById('remoteParticipants');
+        if (remoteParticipants) {
+            remoteParticipants.innerHTML = '';
+        }
+
+        document.querySelectorAll('.voice-channel').forEach(ch => {
+            ch.classList.remove('in-call');
+        });
+
+        removeScreenShareElement();
+        stopCallTimer();
+        chatCallActive = false;
+
+        if (window.currentCallDetails) {
+            window.currentCallDetails = null;
+        }
+
+        stopRingSound();
     }
 
     const callInterface = document.getElementById('callInterface');
-    callInterface.classList.add('hidden');
+    if (callInterface) {
+        callInterface.classList.add('hidden');
+    }
+
+    const chatCallInterface = document.getElementById('chatCallInterface');
+    if (chatCallInterface) {
+        chatCallInterface.classList.add('hidden');
+    }
 
     if (force) {
         isAudioEnabled = true;
+        isMuted = false;
+        isDeafened = false;
+        
+        const muteBtn = document.getElementById('muteBtn');
+        if (muteBtn) {
+            muteBtn.querySelector('.icon-normal').style.display = 'block';
+            muteBtn.querySelector('.icon-slashed').style.display = 'none';
+            muteBtn.classList.remove('active');
+        }
+        
+        const deafenBtn = document.getElementById('deafenBtn');
+        if (deafenBtn) {
+            deafenBtn.querySelector('.icon-normal').style.display = 'block';
+            deafenBtn.querySelector('.icon-slashed').style.display = 'none';
+            deafenBtn.classList.remove('active');
+        }
+        
         updateCallButtons();
+        currentChannel = 'general';
+        currentDMUserId = null;
+        currentDMUsername = null;
+        
+        console.log('Voice channel fully cleaned up');
     }
 }
 
@@ -1524,9 +2339,11 @@ function initializeCallControls() {
     const closeCallBtn = document.getElementById('closeCallBtn');
     const toggleAudioBtn = document.getElementById('toggleAudioBtn');
     const toggleScreenBtn = document.getElementById('toggleScreenBtn');
-    const endCallBtn = document.getElementById('endCallBtn'); // Новая кнопка завершения звонка
     
     closeCallBtn.addEventListener('click', () => {
+        playDisconnectSound();
+        stopRingSound();
+        
         if (window.currentCallDetails) {
             Object.keys(peerConnections).forEach(socketId => {
                 if (socket && socket.connected) {
@@ -1536,20 +2353,6 @@ function initializeCallControls() {
         }
         leaveVoiceChannel(true);
     });
-    
-    // Новая кнопка завершения звонка
-    if (endCallBtn) {
-        endCallBtn.addEventListener('click', () => {
-            if (window.currentCallDetails) {
-                Object.keys(peerConnections).forEach(socketId => {
-                    if (socket && socket.connected) {
-                        socket.emit('end-call', { to: socketId });
-                    }
-                });
-            }
-            leaveVoiceChannel(true);
-        });
-    }
     
     toggleAudioBtn.addEventListener('click', () => {
         toggleAudio();
@@ -1583,27 +2386,27 @@ async function toggleScreenShare(enabled = null) {
     if (enabled === null) enabled = !isScreenSharing;
 
     if (enabled) {
-        if (screenStream) return; // Уже демонстрируем
+        if (screenStream) return;
 
         try {
             screenStream = await navigator.mediaDevices.getDisplayMedia({
-                video: true,
-                audio: true  // Включает системный звук (работает в Chrome с флагом, в Firefox — частично)
+                video: {
+                    cursor: "always",
+                    displaySurface: "monitor"
+                },
+                audio: true
             });
 
-            // Локальный предпросмотр в плавающем окне
             const floatingVideo = document.getElementById('floatingScreenVideo');
             floatingVideo.srcObject = screenStream;
             document.getElementById('floatingScreenShare').classList.remove('hidden');
 
-            // Добавляем все треки экрана во ВСЕ активные peer-соединения
             screenStream.getTracks().forEach(track => {
                 Object.values(peerConnections).forEach(pc => {
                     pc.addTrack(track, screenStream);
                 });
             });
 
-            // Автоматически выключаем при нажатии "Stop sharing" в браузере
             screenStream.getVideoTracks()[0].addEventListener('ended', () => {
                 toggleScreenShare(false);
             });
@@ -1617,14 +2420,11 @@ async function toggleScreenShare(enabled = null) {
     } else {
         if (!screenStream) return;
 
-        // Останавливаем все треки
         screenStream.getTracks().forEach(track => track.stop());
         screenStream = null;
 
-        // Скрываем локальный предпросмотр
         document.getElementById('floatingScreenShare').classList.add('hidden');
 
-        // Удаляем треки экрана из всех peer-соединений
         Object.values(peerConnections).forEach(pc => {
             pc.getSenders().forEach(sender => {
                 if (sender.track && (
@@ -1642,364 +2442,220 @@ async function toggleScreenShare(enabled = null) {
     }
 }
 
-
-async function createRenegotiationOffer(pc, socketId) {
-    try {
-        console.log('Creating renegotiation offer for', socketId);
-        
-        // Создаем новое предложение
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        
-        console.log('Renegotiation offer created, sending to', socketId);
-        
-        // Отправляем новое предложение удаленному пользователю
-        if (socket && socket.connected) {
-            socket.emit('offer', {
-                to: socketId,
-                offer: pc.localDescription
-            });
-        }
-        
-    } catch (error) {
-        console.error('Error creating renegotiation offer:', error);
-    }
-}
-
-async function renegotiate(pc) {
-    if (!pc || pc.signalingState !== 'stable') {
-        console.warn('Cannot renegotiate: signalingState is not stable', pc.signalingState);
-        return;
-    }
-
-    try {
-        console.log('Starting renegotiation');
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        
-        // Send the new offer to the remote peer (replace 'remoteSocketId' with actual ID)
-        // Note: In a multi-user setup, you'd need the socketId associated with this pc
-        const remoteSocketId = Object.keys(peerConnections).find(key => peerConnections[key] === pc);
-        if (remoteSocketId) {
-            socket.emit('offer', {
-                to: remoteSocketId,
-                offer: pc.localDescription
-            });
-            console.log('Renegotiation offer sent to', remoteSocketId);
-        } else {
-            console.error('No socketId found for this peer connection');
-        }
-    } catch (error) {
-        console.error('Error during renegotiation:', error);
-    }
-}
-
 function updateScreenShareButton(active) {
     const btn = document.getElementById('toggleScreenBtn');
     if (btn) {
         btn.classList.toggle('active', active);
     }
-}
-
-function handleRemoteTrack(event, remoteSocketId) {
-    const track = event.track;
-    const stream = new MediaStream([track]);
-
-    if (track.kind === 'video') {
-        const label = track.label.toLowerCase();
-
-        // Определяем, это экран или камера
-        if (label.includes('screen') || label.includes('monitor') || label.includes('display') || label.includes('window')) {
-            // Это демонстрация экрана — показываем отдельно
-            createOrUpdateRemoteScreenShare(remoteSocketId, stream);
-        } else {
-            // Это камера — показываем в основном видео
-            const remoteVideo = document.getElementById(`remote-video-${remoteSocketId}`);
-            if (remoteVideo) {
-                if (!remoteVideo.srcObject) remoteVideo.srcObject = new MediaStream();
-                remoteVideo.srcObject.addTrack(track);
-                remoteVideo.play().catch(e => console.error('Ошибка воспроизведения камеры:', e));
-            }
-        }
+    
+    const chatBtn = document.getElementById('chatToggleScreenBtn');
+    if (chatBtn) {
+        chatBtn.classList.toggle('active', active);
     }
 }
 
-function createOrUpdateRemoteScreenShare(socketId, stream) {
-    let container = document.getElementById(`remote-screen-${socketId}`);
-
-    if (!container) {
-        container = document.createElement('div');
-        container.id = `remote-screen-${socketId}`;
-        container.className = 'remote-screen-share';
-
-        const video = document.createElement('video');
-        video.autoplay = true;
-        video.playsInline = true;
-        video.className = 'remote-screen-video';
-
-        const label = document.createElement('div');
-        label.className = 'screen-share-label';
-        label.textContent = 'Экран собеседника';
-
-        const closeBtn = document.createElement('button');
-        closeBtn.className = 'screen-close-btn';
-        closeBtn.innerHTML = '×';
-        closeBtn.onclick = () => container.remove();
-
-        container.appendChild(video);
-        container.appendChild(label);
-        container.appendChild(closeBtn);
-
-        // Вставляем в область звонка (например, в .call-banner или .chat-call-participants)
-        const parent = document.querySelector('.call-banner') || document.body;
-        parent.appendChild(container);
-
-        // Делаем перемещаемым и изменяемым по размеру
-        makeDraggable(container);
-        makeResizable(container);
-    }
-
-    const video = container.querySelector('video');
-    video.srcObject = stream;
-    video.play().catch(e => console.error('Ошибка воспроизведения экрана:', e));
-}
-
-function makeDraggable(el) {
-    let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-    el.onmousedown = dragMouseDown;
-
-    function dragMouseDown(e) {
-        if (e.target.tagName === 'BUTTON') return;
-        e.preventDefault();
-        pos3 = e.clientX;
-        pos4 = e.clientY;
-        document.onmouseup = closeDrag;
-        document.onmousemove = elementDrag;
-    }
-
-    function elementDrag(e) {
-        e.preventDefault();
-        pos1 = pos3 - e.clientX;
-        pos2 = pos4 - e.clientY;
-        pos3 = e.clientX;
-        pos4 = e.clientY;
-        el.style.top = (el.offsetTop - pos2) + "px";
-        el.style.left = (el.offsetLeft - pos1) + "px";
-    }
-
-    function closeDrag() {
-        document.onmouseup = null;
-        document.onmousemove = null;
+function removeScreenShareElement() {
+    const screenShareDiv = document.getElementById('screen-share-local');
+    if (screenShareDiv) {
+        screenShareDiv.remove();
     }
 }
 
-function showLocalScreenShare(stream) {
-    const remoteParticipants = document.getElementById('remoteParticipants');
-    if (!remoteParticipants) return;
-    
-    // Удаляем старую локальную демонстрацию если есть
-    const oldLocalScreen = document.getElementById('screen-share-local');
-    if (oldLocalScreen) {
-        oldLocalScreen.remove();
-    }
-    
-    // Создаем элемент для локальной демонстрации
-    const screenShareDiv = document.createElement('div');
-    screenShareDiv.className = 'participant screen-share local';
-    screenShareDiv.id = 'screen-share-local';
-    
-    const videoElement = document.createElement('video');
-    videoElement.className = 'screen-video';
-    videoElement.autoplay = true;
-    videoElement.playsInline = true;
-    videoElement.muted = true; // Не нужно слышать свой же экран
-    
-    const screenShareLabel = document.createElement('div');
-    screenShareLabel.className = 'participant-name';
-    screenShareLabel.textContent = 'Your Screen';
-    screenShareLabel.style.color = '#4CAF50';
-    
-    const controlsDiv = document.createElement('div');
-    controlsDiv.className = 'screen-controls';
-    
-    // Кнопка остановки демонстрации
-    const stopButton = document.createElement('button');
-    stopButton.className = 'screen-control-btn stop-btn';
-    stopButton.innerHTML = '⏹';
-    stopButton.title = 'Stop Sharing';
-    stopButton.onclick = () => toggleScreenShare();
-    
-    controlsDiv.appendChild(stopButton);
-    
-    screenShareDiv.appendChild(videoElement);
-    screenShareDiv.appendChild(screenShareLabel);
-    screenShareDiv.appendChild(controlsDiv);
-    
-    // Вставляем в начало списка участников
-    remoteParticipants.insertBefore(screenShareDiv, remoteParticipants.firstChild);
-    
-    // Устанавливаем поток
-    videoElement.srcObject = stream;
-    
-    // Автоматическое воспроизведение
-    videoElement.play().catch(e => {
-        console.error('Error playing local screen share:', e);
-    });
-}
-
-
-function showScreenShare(stream) {
-    const screenShareContainer = document.getElementById('screenShareContainer');
-    const screenShareVideo = document.getElementById('screenShareVideo');
-    const chatCallParticipants = document.querySelector('.chat-call-participants');
-    
-    if (screenShareContainer && screenShareVideo) {
-        // Показываем контейнер
-        screenShareContainer.classList.remove('hidden');
-        
-        // Добавляем класс для затемнения фона
-        chatCallParticipants.classList.add('has-screen-share');
-        
-        // Устанавливаем поток в видео элемент
-        screenShareVideo.srcObject = stream;
-        
-        // Автовоспроизведение
-        screenShareVideo.play().catch(e => {
-            console.error('Error playing screen share video:', e);
-        });
-        
-        // Настройка обработчика для кнопки остановки
-        const stopScreenShareBtn = document.getElementById('stopScreenShareBtn');
-        if (stopScreenShareBtn) {
-            stopScreenShareBtn.onclick = () => toggleScreenShare();
-        }
-    }
-}
-
-function stopScreenShare() {
-    console.log('Stopping screen share');
-    
-    if (screenStream) {
-        // Останавливаем все треки
-        screenStream.getTracks().forEach(track => {
-            console.log('Stopping track:', track.id, track.kind);
-            track.stop();
-        });
-        
-        // Удаляем видео-треки из всех соединений
-        Object.keys(peerConnections).forEach(socketId => {
-            const pc = peerConnections[socketId];
-            if (pc) {
-                const senders = pc.getSenders();
-                senders.forEach(sender => {
-                    if (sender.track && sender.track.kind === 'video') {
-                        console.log('Removing video sender from connection with', socketId);
-                        pc.removeTrack(sender);
-                    }
-                });
-                
-                // Создаем новое предложение БЕЗ видео-трека
-                createRenegotiationOffer(pc, socketId);
-            }
-        });
-        
-        screenStream = null;
-    }
-    
-    // Удаляем локальный элемент демонстрации
-    removeScreenShareElement();
-    
-    // Обновляем кнопку
-    updateScreenShareButton(false);
-	debugPeerConnections();
-    console.log('Screen share stopped');
-}
-	
-	// Добавьте в глобальную область видимости
-// Добавьте эту функцию в глобальную область видимости (например, рядом с другими глобальными функциями)
-function debugPeerConnections() {
-    console.log('=== DEBUG: Peer Connections ===');
-    console.log('Active connections:', Object.keys(peerConnections).length);
-    
-    Object.keys(peerConnections).forEach(socketId => {
-        const pc = peerConnections[socketId];
-        console.log(`\nConnection to ${socketId}:`);
-        console.log('  State:', pc.connectionState);
-        console.log('  ICE state:', pc.iceConnectionState);
-        console.log('  Signaling:', pc.signalingState);
-        
-        const senders = pc.getSenders();
-        console.log('  Senders:', senders.length);
-        senders.forEach((sender, i) => {
-            if (sender.track) {
-                console.log(`    ${i}: ${sender.track.kind} - ${sender.track.label} (${sender.track.readyState})`);
-            } else {
-                console.log(`    ${i}: No track`);
-            }
-        });
-        
-        const receivers = pc.getReceivers();
-        console.log('  Receivers:', receivers.length);
-        receivers.forEach((receiver, i) => {
-            if (receiver.track) {
-                console.log(`    ${i}: ${receiver.track.kind} - ${receiver.track.label} (${receiver.track.readyState})`);
-            } else {
-                console.log(`    ${i}: No track`);
-            }
-        });
-    });
-    
-    console.log('Screen stream active:', !!screenStream);
-    if (screenStream) {
-        console.log('Screen tracks:', screenStream.getTracks().length);
-        screenStream.getTracks().forEach((track, i) => {
-            console.log(`  Track ${i}: ${track.kind} - ${track.label} (${track.readyState})`);
-        });
-    }
-    console.log('Local audio stream active:', !!localAudioStream);
-    console.log('========================\n');
-}
-
-// Функция обновления кнопки демонстрации экрана
-function updateScreenShareButton(isActive) {
-    const chatToggleScreenBtn = document.getElementById('chatToggleScreenBtn');
+function updateCallButtons() {
+    const toggleAudioBtn = document.getElementById('toggleAudioBtn');
     const toggleScreenBtn = document.getElementById('toggleScreenBtn');
+    const chatToggleAudioBtn = document.getElementById('chatToggleAudioBtn');
+    const chatToggleScreenBtn = document.getElementById('chatToggleScreenBtn');
     
-    if (chatToggleScreenBtn) {
-        chatToggleScreenBtn.classList.toggle('screen-active', isActive);
-        chatToggleScreenBtn.title = isActive ? 'Stop sharing screen' : 'Share screen';
+    if (toggleAudioBtn) {
+        toggleAudioBtn.classList.toggle('active', !isAudioEnabled);
     }
     
     if (toggleScreenBtn) {
-        toggleScreenBtn.classList.toggle('screen-active', isActive);
-        toggleScreenBtn.title = isActive ? 'Stop sharing screen' : 'Share screen';
+        toggleScreenBtn.classList.toggle('active', isScreenSharing);
+    }
+    
+    if (chatToggleAudioBtn) {
+        chatToggleAudioBtn.classList.toggle('active', !isAudioEnabled);
+    }
+    
+    if (chatToggleScreenBtn) {
+        chatToggleScreenBtn.classList.toggle('active', isScreenSharing);
     }
 }
 
-// Создать элемент для демонстрации экрана
-function createScreenShareElement(stream) {
+// ============================================================================
+// WEBRTC PEER CONNECTIONS
+// ============================================================================
+
+async function createPeerConnection(remoteSocketId, isInitiator) {
+    console.log(`Creating peer connection with ${remoteSocketId}, initiator: ${isInitiator}`);
+    
+    if (peerConnections[remoteSocketId]) {
+        console.log('Peer connection already exists');
+        return peerConnections[remoteSocketId];
+    }
+    
+    if (!localAudioStream) {
+        try {
+            await ensureLocalAudio(noiseSuppressionEnabled);
+        } catch (error) {
+            console.error('Failed to get local audio stream:', error);
+            return null;
+        }
+    }
+    
+    const pc = new RTCPeerConnection({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' }
+        ],
+        iceCandidatePoolSize: 10,
+        iceTransportPolicy: 'all',
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require'
+    });
+
+    peerConnections[remoteSocketId] = pc;
+
+    if (localAudioStream) {
+        const audioTracks = localAudioStream.getAudioTracks();
+        audioTracks.forEach(track => {
+            pc.addTrack(track, localAudioStream);
+        });
+    }
+    
+    if (screenStream) {
+        const videoTracks = screenStream.getVideoTracks();
+        videoTracks.forEach(track => {
+            pc.addTrack(track, screenStream);
+        });
+    }
+
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            socket.emit('ice-candidate', {
+                to: remoteSocketId,
+                candidate: event.candidate
+            });
+        }
+    };
+    
+    pc.oniceconnectionstatechange = () => {
+        console.log(`ICE connection state for ${remoteSocketId}: ${pc.iceConnectionState}`);
+        
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+            console.log(`ICE connection failed for ${remoteSocketId}, attempting restart...`);
+            // Could implement ICE restart here if needed
+        }
+    };
+    
+    pc.onconnectionstatechange = () => {
+        console.log(`Connection state for ${remoteSocketId}: ${pc.connectionState}`);
+    };
+
+    pc.ontrack = (event) => {
+        console.log('Received remote track from', remoteSocketId);
+        
+        const remoteParticipants = document.getElementById('remoteParticipants');
+        
+        let participantDiv = document.getElementById(`participant-${remoteSocketId}`);
+        
+        if (!participantDiv) {
+            participantDiv = document.createElement('div');
+            participantDiv.className = 'participant';
+            participantDiv.id = `participant-${remoteSocketId}`;
+            
+            const audioElement = document.createElement('audio');
+            audioElement.id = `remote-audio-${remoteSocketId}`;
+            audioElement.className = 'audio-element';
+            audioElement.autoplay = true;
+            audioElement.playsInline = true;
+            audioElement.volume = isDeafened ? 0 : 1;
+            
+            const participantName = document.createElement('div');
+            participantName.className = 'participant-name';
+            participantName.textContent = 'Friend';
+            
+            const participantStatus = document.createElement('div');
+            participantStatus.className = 'participant-status';
+            participantStatus.textContent = 'Speaking...';
+            participantStatus.style.display = 'none';
+            
+            participantDiv.appendChild(audioElement);
+            participantDiv.appendChild(participantName);
+            participantDiv.appendChild(participantStatus);
+            remoteParticipants.appendChild(participantDiv);
+        }
+        
+        if (event.track.kind === 'video') {
+            createRemoteScreenShareElement(remoteSocketId, event.streams[0]);
+        } else if (event.track.kind === 'audio') {
+            const audioElement = document.getElementById(`remote-audio-${remoteSocketId}`);
+            if (audioElement) {
+                audioElement.srcObject = event.streams[0];
+                
+                // Auto-play with user gesture fallback
+                const playPromise = audioElement.play();
+                if (playPromise !== undefined) {
+                    playPromise.catch(error => {
+                        console.error('Error playing remote audio:', error);
+                        // Add click listener to retry play
+                        document.addEventListener('click', () => {
+                            audioElement.play().catch(err => console.error('Still cannot play:', err));
+                        }, { once: true });
+                    });
+                }
+            }
+        }
+    };
+
+    if (isInitiator) {
+        try {
+            const offer = await pc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+            });
+            await pc.setLocalDescription(offer);
+            socket.emit('offer', {
+                to: remoteSocketId,
+                offer: pc.localDescription
+            });
+        } catch (error) {
+            console.error('Error creating offer:', error);
+        }
+    }
+    
+    return pc;
+}
+
+function createRemoteScreenShareElement(socketId, stream) {
     const remoteParticipants = document.getElementById('remoteParticipants');
     
-    // Создаем контейнер для демонстрации экрана
-    const screenShareDiv = document.createElement('div');
-    screenShareDiv.className = 'participant screen-share';
-    screenShareDiv.id = 'screen-share-local';
+    const oldElement = document.getElementById(`screen-share-remote-${socketId}`);
+    if (oldElement) {
+        oldElement.remove();
+    }
     
-    // Создаем видео элемент
+    const screenShareDiv = document.createElement('div');
+    screenShareDiv.className = 'participant screen-share remote';
+    screenShareDiv.id = `screen-share-remote-${socketId}`;
+    
     const videoElement = document.createElement('video');
     videoElement.className = 'screen-video';
     videoElement.autoplay = true;
     videoElement.playsInline = true;
-    videoElement.muted = true; // Не нужно слышать свой же экран
     
     const screenShareLabel = document.createElement('div');
     screenShareLabel.className = 'participant-name';
-    screenShareLabel.textContent = 'Your Screen';
+    screenShareLabel.textContent = `Friend's Screen`;
     
     const controlsDiv = document.createElement('div');
     controlsDiv.className = 'screen-controls';
     
-    // Кнопка развернуть на полный экран
     const fullscreenBtn = document.createElement('button');
     fullscreenBtn.className = 'screen-control-btn fullscreen-btn';
     fullscreenBtn.innerHTML = '⛶';
@@ -2014,53 +2670,40 @@ function createScreenShareElement(stream) {
         }
     };
     
-    // Кнопка остановки демонстрации экрана
-    const stopButton = document.createElement('button');
-    stopButton.className = 'screen-control-btn stop-btn';
-    stopButton.innerHTML = '⏹';
-    stopButton.title = 'Stop Sharing';
-    stopButton.onclick = () => toggleScreenShare();
-    
     controlsDiv.appendChild(fullscreenBtn);
-    controlsDiv.appendChild(stopButton);
     
     screenShareDiv.appendChild(videoElement);
     screenShareDiv.appendChild(screenShareLabel);
     screenShareDiv.appendChild(controlsDiv);
     remoteParticipants.appendChild(screenShareDiv);
     
-    // Устанавливаем поток в видео элемент
     videoElement.srcObject = stream;
     
-    // Автоматическое воспроизведение
-    videoElement.play().catch(e => {
-        console.error('Error playing screen share video:', e);
-    });
+    const playPromise = videoElement.play();
+    if (playPromise !== undefined) {
+        playPromise.catch(e => {
+            console.error('Error playing remote screen share video:', e);
+        });
+    }
     
-    // Добавляем возможность изменения размера
     makeResizable(screenShareDiv);
 }
 
-// Удалить элемент демонстрации экрана
-function removeScreenShareElement() {
-    const screenShareDiv = document.getElementById('screen-share-local');
-    if (screenShareDiv) {
-        screenShareDiv.remove();
+function removeRemoteParticipant(socketId) {
+    const participantDiv = document.getElementById(`participant-${socketId}`);
+    if (participantDiv) {
+        participantDiv.remove();
+    }
+    
+    const remoteScreen = document.getElementById(`screen-share-remote-${socketId}`);
+    if (remoteScreen) {
+        remoteScreen.remove();
     }
 }
 
-function updateCallButtons() {
-    const toggleAudioBtn = document.getElementById('toggleAudioBtn');
-    const toggleScreenBtn = document.getElementById('toggleScreenBtn');
-    
-    if (toggleAudioBtn) {
-        toggleAudioBtn.classList.toggle('active', !isAudioEnabled);
-    }
-    
-    if (toggleScreenBtn) {
-        toggleScreenBtn.classList.toggle('active', screenStream !== null);
-    }
-}
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
 function initializeDraggableCallWindow() {
    const callInterface = document.getElementById('callInterface');
@@ -2098,8 +2741,795 @@ function initializeDraggableCallWindow() {
        }
    });
    
-   // Добавляем возможность изменения размера окна звонка
    makeResizable(callInterface);
+}
+
+// ============================================================================
+// SETTINGS MANAGEMENT
+// ============================================================================
+
+function initializeSettingsModal() {
+    const settingsBtn = document.getElementById('settingsBtn');
+    const settingsModal = document.getElementById('settingsModal');
+    const closeBtn = document.getElementById('settingsCloseBtn');
+    const cancelBtn = document.getElementById('settingsCancelBtn');
+    const saveBtn = document.getElementById('settingsSaveBtn');
+    const resetBtn = document.getElementById('settingsResetBtn');
+    
+    // Открытие модального окна при клике на кнопку настроек
+    settingsBtn.addEventListener('click', () => {
+        openSettingsModal();
+    });
+    
+    // Закрытие модального окна
+    closeBtn.addEventListener('click', closeSettingsModal);
+    cancelBtn.addEventListener('click', closeSettingsModal);
+    
+    // Сохранение настроек
+    saveBtn.addEventListener('click', saveSettings);
+    
+    // Сброс настроек
+    resetBtn.addEventListener('click', resetSettings);
+    
+    // Закрытие по клику вне модального окна
+    settingsModal.addEventListener('click', (e) => {
+        if (e.target === settingsModal) {
+            closeSettingsModal();
+        }
+    });
+    
+    // Инициализация элементов управления
+    initializeSettingsControls();
+    
+    // Загрузка сохраненных настроек
+    loadSettings();
+}
+
+function openSettingsModal() {
+    const settingsModal = document.getElementById('settingsModal');
+    settingsModal.classList.remove('hidden');
+    settingsModalOpen = true;
+    
+    // Загрузка доступных устройств
+    loadAudioDevices();
+    
+    // Обновление значений в UI
+    updateSettingsUI();
+}
+
+function closeSettingsModal() {
+    const settingsModal = document.getElementById('settingsModal');
+    settingsModal.classList.add('hidden');
+    settingsModalOpen = false;
+    
+    // Остановка теста микрофона при закрытии
+    stopMicrophoneTest();
+    
+    // Восстановление исходных настроек из localStorage
+    loadSettings();
+}
+
+function initializeSettingsControls() {
+    // Слайдеры громкости
+    const inputVolume = document.getElementById('inputVolume');
+    const outputVolume = document.getElementById('outputVolume');
+    const voiceThreshold = document.getElementById('voiceThreshold');
+    const voiceSensitivity = document.getElementById('voiceSensitivity');
+    
+    // Обновление значений в реальном времени
+    if (inputVolume) {
+        inputVolume.addEventListener('input', () => {
+            const value = document.getElementById('inputVolumeValue');
+            if (value) value.textContent = `${inputVolume.value}%`;
+        });
+    }
+    
+    if (outputVolume) {
+        outputVolume.addEventListener('input', () => {
+            const value = document.getElementById('outputVolumeValue');
+            if (value) value.textContent = `${outputVolume.value}%`;
+            applyOutputVolume();
+        });
+    }
+    
+    if (voiceThreshold) {
+        voiceThreshold.addEventListener('input', () => {
+            const value = document.getElementById('voiceThresholdValue');
+            if (value) value.textContent = `${voiceThreshold.value} dB`;
+        });
+    }
+    
+    if (voiceSensitivity) {
+        voiceSensitivity.addEventListener('input', () => {
+            const value = parseInt(voiceSensitivity.value);
+            let label = 'Низкая';
+            if (value > 7) label = 'Высокая';
+            else if (value > 4) label = 'Средняя';
+            const display = document.getElementById('voiceSensitivityValue');
+            if (display) display.textContent = label;
+        });
+    }
+    
+    // Тест микрофона
+    const testMicBtn = document.getElementById('testMicrophoneBtn');
+    if (testMicBtn) {
+        testMicBtn.addEventListener('click', startMicrophoneTest);
+    }
+    
+    // Тест звука
+    const testOutputBtn = document.getElementById('testOutputBtn');
+    if (testOutputBtn) {
+        testOutputBtn.addEventListener('click', () => {
+            // Создаем простой тестовый звук на лету
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            
+            oscillator.type = 'sine';
+            oscillator.frequency.value = 440;
+            gainNode.gain.value = 0.1;
+            
+            const duration = 0.5;
+            
+            oscillator.start();
+            oscillator.stop(audioContext.currentTime + duration);
+            
+            const status = document.getElementById('audioTestStatus');
+            if (status) {
+                status.textContent = 'Воспроизведение тестового звука...';
+                status.classList.add('playing');
+                
+                setTimeout(() => {
+                    status.textContent = 'Тест завершен';
+                    status.classList.remove('playing');
+                }, duration * 1000 + 100);
+            }
+            
+            // Очистка
+            setTimeout(() => {
+                oscillator.disconnect();
+                gainNode.disconnect();
+            }, (duration + 0.1) * 1000);
+        });
+    }
+}
+
+function loadSettings() {
+    // Загрузка настроек из localStorage
+    const savedNoiseSuppression = localStorage.getItem('noiseSuppressionEnabled');
+    const savedEchoCancellation = localStorage.getItem('echoCancellationEnabled');
+    const savedAutoGainControl = localStorage.getItem('autoGainControlEnabled');
+    const savedVoiceMode = localStorage.getItem('voiceMode');
+    const savedVoiceThreshold = localStorage.getItem('voiceThreshold');
+    const savedVoiceSensitivity = localStorage.getItem('voiceSensitivity');
+    const savedInputVolume = localStorage.getItem('inputVolume');
+    const savedOutputVolume = localStorage.getItem('outputVolume');
+    const savedAudioInput = localStorage.getItem('selectedAudioInput');
+    const savedAudioOutput = localStorage.getItem('selectedAudioOutput');
+    
+    // Обновление глобальных переменных
+    if (savedNoiseSuppression !== null) {
+        noiseSuppressionEnabled = savedNoiseSuppression === 'true';
+    }
+    
+    if (savedEchoCancellation !== null) {
+        audioConstraints.echoCancellation = savedEchoCancellation === 'true';
+    }
+    
+    if (savedAutoGainControl !== null) {
+        audioConstraints.autoGainControl = savedAutoGainControl === 'true';
+    }
+    
+    if (savedAudioInput) {
+        selectedAudioInput = savedAudioInput;
+    }
+    
+    if (savedAudioOutput) {
+        selectedAudioOutput = savedAudioOutput;
+    }
+    
+    // Применение настроек к элементам UI если они существуют
+    const noiseSuppressionToggle = document.getElementById('noiseSuppressionToggle');
+    const echoCancellationToggle = document.getElementById('echoCancellationToggle');
+    const autoGainControlToggle = document.getElementById('autoGainControlToggle');
+    
+    if (noiseSuppressionToggle && savedNoiseSuppression !== null) {
+        noiseSuppressionToggle.checked = noiseSuppressionEnabled;
+    }
+    
+    if (echoCancellationToggle && savedEchoCancellation !== null) {
+        echoCancellationToggle.checked = audioConstraints.echoCancellation;
+    }
+    
+    if (autoGainControlToggle && savedAutoGainControl !== null) {
+        autoGainControlToggle.checked = audioConstraints.autoGainControl;
+    }
+    
+    if (savedVoiceMode) {
+        const voiceModeRadio = document.querySelector(`input[name="voiceMode"][value="${savedVoiceMode}"]`);
+        if (voiceModeRadio) {
+            voiceModeRadio.checked = true;
+        }
+    }
+    
+    if (savedVoiceThreshold) {
+        const voiceThresholdElem = document.getElementById('voiceThreshold');
+        const voiceThresholdValue = document.getElementById('voiceThresholdValue');
+        if (voiceThresholdElem && voiceThresholdValue) {
+            voiceThresholdElem.value = savedVoiceThreshold;
+            voiceThresholdValue.textContent = `${savedVoiceThreshold} dB`;
+        }
+    }
+    
+    if (savedVoiceSensitivity) {
+        const voiceSensitivityElem = document.getElementById('voiceSensitivity');
+        const voiceSensitivityValue = document.getElementById('voiceSensitivityValue');
+        if (voiceSensitivityElem && voiceSensitivityValue) {
+            voiceSensitivityElem.value = savedVoiceSensitivity;
+            const value = parseInt(savedVoiceSensitivity);
+            let label = 'Низкая';
+            if (value > 7) label = 'Высокая';
+            else if (value > 4) label = 'Средняя';
+            voiceSensitivityValue.textContent = label;
+        }
+    }
+    
+    if (savedInputVolume) {
+        const inputVolumeElem = document.getElementById('inputVolume');
+        const inputVolumeValue = document.getElementById('inputVolumeValue');
+        if (inputVolumeElem && inputVolumeValue) {
+            inputVolumeElem.value = savedInputVolume;
+            inputVolumeValue.textContent = `${savedInputVolume}%`;
+        }
+    }
+    
+    if (savedOutputVolume) {
+        const outputVolumeElem = document.getElementById('outputVolume');
+        const outputVolumeValue = document.getElementById('outputVolumeValue');
+        if (outputVolumeElem && outputVolumeValue) {
+            outputVolumeElem.value = savedOutputVolume;
+            outputVolumeValue.textContent = `${savedOutputVolume}%`;
+        }
+    }
+    
+    // Применение устройства вывода
+    if (savedAudioOutput) {
+        applyAudioOutput(savedAudioOutput);
+    }
+}
+
+async function loadAudioDevices() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        console.warn('Media Devices API not supported');
+        return;
+    }
+    
+    try {
+        // Сначала запросим разрешение на доступ к микрофону для получения меток устройств
+        if (!localAudioStream) {
+            await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        audioDevices.input = devices.filter(device => device.kind === 'audioinput');
+        audioDevices.output = devices.filter(device => device.kind === 'audiooutput');
+        
+        console.log('Найдены устройства ввода:', audioDevices.input);
+        console.log('Найдены устройства вывода:', audioDevices.output);
+        
+        updateDeviceSelectors();
+    } catch (error) {
+        console.error('Error loading audio devices:', error);
+        // Пробуем без разрешения на микрофон
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            audioDevices.input = devices.filter(device => device.kind === 'audioinput');
+            audioDevices.output = devices.filter(device => device.kind === 'audiooutput');
+            updateDeviceSelectors();
+        } catch (e) {
+            console.error('Failed to enumerate devices:', e);
+        }
+    }
+}
+
+function updateDeviceSelectors() {
+    const inputSelect = document.getElementById('audioInputSelect');
+    const outputSelect = document.getElementById('audioOutputSelect');
+    
+    if (!inputSelect || !outputSelect) return;
+    
+    // Очистка списков
+    inputSelect.innerHTML = '<option value="">Выберите микрофон...</option>';
+    outputSelect.innerHTML = '<option value="">Выберите динамики...</option>';
+    
+    // Добавление устройств ввода
+    audioDevices.input.forEach((device, index) => {
+        const option = document.createElement('option');
+        option.value = device.deviceId;
+        const label = device.label || `Микрофон ${index + 1}`;
+        option.textContent = label;
+        option.title = device.deviceId;
+        inputSelect.appendChild(option);
+    });
+    
+    // Добавление устройств вывода
+    audioDevices.output.forEach((device, index) => {
+        const option = document.createElement('option');
+        option.value = device.deviceId;
+        const label = device.label || `Динамики ${index + 1}`;
+        option.textContent = label;
+        option.title = device.deviceId;
+        outputSelect.appendChild(option);
+    });
+    
+    // Установка сохраненных значений
+    const savedInput = localStorage.getItem('selectedAudioInput');
+    const savedOutput = localStorage.getItem('selectedAudioOutput');
+    
+    if (savedInput && inputSelect.querySelector(`[value="${savedInput}"]`)) {
+        inputSelect.value = savedInput;
+        selectedAudioInput = savedInput;
+    }
+    
+    if (savedOutput && outputSelect.querySelector(`[value="${savedOutput}"]`)) {
+        outputSelect.value = savedOutput;
+        selectedAudioOutput = savedOutput;
+    }
+    
+    // Если нет сохраненного значения, выбираем первое устройство
+    if (!savedInput && audioDevices.input.length > 0) {
+        inputSelect.value = audioDevices.input[0].deviceId;
+    }
+    
+    if (!savedOutput && audioDevices.output.length > 0) {
+        outputSelect.value = audioDevices.output[0].deviceId;
+    }
+}
+
+function applyAudioOutput(deviceId) {
+    if (!deviceId) return;
+    
+    console.log('Применяю устройство вывода:', deviceId);
+    
+    // Для наушников/динамиков в WebRTC нужно использовать setSinkId
+    // Это применяется к аудио элементам
+    document.querySelectorAll('.audio-element').forEach(audio => {
+        if (audio.setSinkId) {
+            audio.setSinkId(deviceId)
+                .then(() => {
+                    console.log('Устройство вывода применено к аудио элементу');
+                })
+                .catch(error => {
+                    console.error('Ошибка применения устройства вывода:', error);
+                });
+        }
+    });
+    
+    // Для тестового звука
+    const testSound = document.getElementById('testSound');
+    if (testSound && testSound.setSinkId) {
+        testSound.setSinkId(deviceId)
+            .catch(error => {
+                console.error('Ошибка применения устройства вывода к тестовому звуку:', error);
+            });
+    }
+}
+
+function saveSettings() {
+    // Получение значений из формы
+    const noiseSuppression = document.getElementById('noiseSuppressionToggle').checked;
+    const echoCancellation = document.getElementById('echoCancellationToggle').checked;
+    const autoGainControl = document.getElementById('autoGainControlToggle').checked;
+    const voiceMode = document.querySelector('input[name="voiceMode"]:checked')?.value || 'auto';
+    const voiceThreshold = document.getElementById('voiceThreshold').value;
+    const voiceSensitivity = document.getElementById('voiceSensitivity').value;
+    const inputVolume = document.getElementById('inputVolume').value;
+    const outputVolume = document.getElementById('outputVolume').value;
+    const audioInput = document.getElementById('audioInputSelect').value;
+    const audioOutput = document.getElementById('audioOutputSelect').value;
+    
+    // Валидация
+    if (!audioInput && audioDevices.input.length > 0) {
+        alert('Пожалуйста, выберите микрофон');
+        return;
+    }
+    
+    // Сохранение настроек в localStorage
+    localStorage.setItem('noiseSuppressionEnabled', noiseSuppression);
+    localStorage.setItem('echoCancellationEnabled', echoCancellation);
+    localStorage.setItem('autoGainControlEnabled', autoGainControl);
+    localStorage.setItem('voiceMode', voiceMode);
+    localStorage.setItem('voiceThreshold', voiceThreshold);
+    localStorage.setItem('voiceSensitivity', voiceSensitivity);
+    localStorage.setItem('inputVolume', inputVolume);
+    localStorage.setItem('outputVolume', outputVolume);
+    
+    if (audioInput) {
+        localStorage.setItem('selectedAudioInput', audioInput);
+        selectedAudioInput = audioInput;
+    }
+    
+    if (audioOutput) {
+        localStorage.setItem('selectedAudioOutput', audioOutput);
+        selectedAudioOutput = audioOutput;
+        // Немедленно применяем устройство вывода
+        applyAudioOutput(audioOutput);
+    }
+    
+    // Обновление глобальных переменных
+    noiseSuppressionEnabled = noiseSuppression;
+    audioConstraints.echoCancellation = echoCancellation;
+    audioConstraints.autoGainControl = autoGainControl;
+    
+    // Перезапуск аудио с новыми настройками если мы в звонке
+    if (inCall && localAudioStream) {
+        restartAudioWithNewSettings();
+    }
+    
+    // Применение громкости
+    applyOutputVolume();
+    applyInputVolume(parseInt(inputVolume) / 100);
+    
+    // Показать уведомление
+    showNotification('Настройки', 'Настройки сохранены успешно');
+    
+    // Закрыть модальное окно
+    closeSettingsModal();
+}
+
+function resetSettings() {
+    if (confirm('Вы уверены, что хотите сбросить все настройки к значениям по умолчанию?')) {
+        // Сброс значений по умолчанию
+        document.getElementById('noiseSuppressionToggle').checked = true;
+        document.getElementById('echoCancellationToggle').checked = true;
+        document.getElementById('autoGainControlToggle').checked = true;
+        document.getElementById('voiceActivityAuto').checked = true;
+        document.getElementById('voiceThreshold').value = -30;
+        document.getElementById('voiceThresholdValue').textContent = '-30 dB';
+        document.getElementById('voiceSensitivity').value = 5;
+        document.getElementById('voiceSensitivityValue').textContent = 'Средняя';
+        document.getElementById('inputVolume').value = 100;
+        document.getElementById('inputVolumeValue').textContent = '100%';
+        document.getElementById('outputVolume').value = 100;
+        document.getElementById('outputVolumeValue').textContent = '100%';
+        
+        // Сброс выбора устройств
+        const inputSelect = document.getElementById('audioInputSelect');
+        const outputSelect = document.getElementById('audioOutputSelect');
+        
+        if (inputSelect.options.length > 0) {
+            inputSelect.selectedIndex = 0;
+        }
+        
+        if (outputSelect.options.length > 0) {
+            outputSelect.selectedIndex = 0;
+        }
+        
+        showNotification('Настройки', 'Настройки сброшены');
+    }
+}
+
+function applyOutputVolume() {
+    const volumeSlider = document.getElementById('outputVolume');
+    if (!volumeSlider) return;
+    
+    const volume = parseInt(volumeSlider.value) / 100;
+    
+    console.log('Установка громкости вывода:', volume);
+    
+    // Применение громкости ко всем аудио элементам
+    document.querySelectorAll('.audio-element').forEach(audio => {
+        audio.volume = volume;
+    });
+    
+    // Применение громкости к тестовому звуку
+    const testSound = document.getElementById('testSound');
+    if (testSound) {
+        testSound.volume = volume;
+    }
+}
+
+function updateSettingsUI() {
+    // Обновление значений в UI на основе сохраненных настроек
+    loadSettings();
+}
+
+function restartAudioWithNewSettings() {
+    if (!localAudioStream || !inCall) return;
+    
+    const oldStream = localAudioStream;
+    const wasMuted = isMuted;
+    
+    try {
+        // Остановка старых треков
+        oldStream.getTracks().forEach(track => {
+            try {
+                track.stop();
+            } catch (e) {
+                // Игнорировать ошибки остановки
+            }
+        });
+        
+        // Получение нового потока с обновленными настройками
+        ensureLocalAudio(noiseSuppressionEnabled).then(newStream => {
+            // Обновление всех peer connections с новым аудио треком
+            const newAudioTrack = newStream.getAudioTracks()[0];
+            if (newAudioTrack) {
+                Object.values(peerConnections).forEach(pc => {
+                    try {
+                        const senders = pc.getSenders();
+                        senders.forEach(sender => {
+                            if (sender.track && sender.track.kind === 'audio') {
+                                sender.replaceTrack(newAudioTrack);
+                            }
+                        });
+                    } catch (error) {
+                        console.warn('Ошибка обновления peer connection:', error);
+                    }
+                });
+            }
+            
+            // Восстановление состояния mute
+            if (wasMuted && newStream) {
+                newStream.getAudioTracks().forEach(track => {
+                    track.enabled = false;
+                });
+            }
+            
+            console.log('Аудио перезапущено с новыми настройками');
+        }).catch(error => {
+            console.error('Ошибка перезапуска аудио:', error);
+        });
+        
+    } catch (error) {
+        console.error('Ошибка перезапуска аудио:', error);
+    }
+}
+
+// ============================================================================
+// MICROPHONE TEST
+// ============================================================================
+
+async function startMicrophoneTest() {
+    const status = document.getElementById('audioTestStatus');
+    if (!status) return;
+    
+    try {
+        // Остановка предыдущего теста если он был
+        stopMicrophoneTest();
+        
+        // Получение настроек устройства ввода
+        const deviceId = document.getElementById('audioInputSelect').value;
+        
+        if (!deviceId && audioDevices.input.length > 0) {
+            // Используем первое устройство если ничего не выбрано
+            deviceId = audioDevices.input[0].deviceId;
+        }
+        
+        if (!deviceId) {
+            status.textContent = 'Микрофон не найден';
+            return;
+        }
+        
+        // Получение потока с выбранным устройством
+        const constraints = {
+            audio: {
+                deviceId: { exact: deviceId },
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false
+            }
+        };
+        
+        testMicrophoneStream = await navigator.mediaDevices.getUserMedia(constraints);
+        
+        // Создание AudioContext для анализа
+        testAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+        testAnalyser = testAudioContext.createAnalyser();
+        testAnalyser.fftSize = 256;
+        
+        const source = testAudioContext.createMediaStreamSource(testMicrophoneStream);
+        source.connect(testAnalyser);
+        
+        // Простой индикатор уровня
+        status.textContent = 'Говорите в микрофон... Уровень: 0%';
+        status.classList.add('speaking');
+        
+        // Функция обновления уровня
+        function updateLevel() {
+            if (!testAnalyser) return;
+            
+            const dataArray = new Uint8Array(testAnalyser.frequencyBinCount);
+            testAnalyser.getByteFrequencyData(dataArray);
+            
+            // Расчет среднего уровня
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+                sum += dataArray[i];
+            }
+            const average = sum / dataArray.length;
+            const level = Math.floor((average / 256) * 100);
+            
+            // Обновление текста
+            status.textContent = `Говорите в микрофон... Уровень: ${level}%`;
+            
+            // Продолжаем анимацию если тест активен
+            if (testAnalyser) {
+                requestAnimationFrame(updateLevel);
+            }
+        }
+        
+        updateLevel();
+        
+    } catch (error) {
+        console.error('Ошибка теста микрофона:', error);
+        status.textContent = `Ошибка: ${error.message}`;
+        status.classList.remove('speaking');
+    }
+}
+
+function createLevelVisualizer() {
+    const status = document.getElementById('audioTestStatus');
+    
+    // Создаем контейнер для визуализатора
+    let visualizer = status.querySelector('.level-visualizer');
+    if (!visualizer) {
+        visualizer = document.createElement('div');
+        visualizer.className = 'level-visualizer';
+        visualizer.style.cssText = `
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            margin-left: 10px;
+            vertical-align: middle;
+        `;
+        status.appendChild(visualizer);
+    }
+    
+    // Очищаем и создаем новые бары
+    visualizer.innerHTML = '';
+    for (let i = 0; i < 10; i++) {
+        const bar = document.createElement('div');
+        bar.className = 'level-bar';
+        bar.style.cssText = `
+            width: 3px;
+            height: 10px;
+            background-color: #43b581;
+            border-radius: 1px;
+            opacity: 0.3;
+            transition: all 0.1s;
+        `;
+        visualizer.appendChild(bar);
+    }
+    
+    // Функция обновления визуализатора
+    function updateVisualizer() {
+        if (!testAnalyser || !visualizer.parentNode) {
+            return;
+        }
+        
+        const dataArray = new Uint8Array(testAnalyser.frequencyBinCount);
+        testAnalyser.getByteFrequencyData(dataArray);
+        
+        // Расчет среднего уровня
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+        const level = Math.floor((average / 256) * 100);
+        
+        // Обновление баров
+        const bars = visualizer.querySelectorAll('.level-bar');
+        const activeBars = Math.floor((level / 100) * bars.length);
+        
+        bars.forEach((bar, index) => {
+            if (index < activeBars) {
+                const height = 10 + (index * 2); // Выше для более правых баров
+                bar.style.height = `${height}px`;
+                bar.style.opacity = '1';
+                bar.style.backgroundColor = index > 7 ? '#ed4245' : 
+                                           index > 4 ? '#faa81a' : 
+                                           '#43b581';
+            } else {
+                bar.style.height = '10px';
+                bar.style.opacity = '0.3';
+                bar.style.backgroundColor = '#43b581';
+            }
+        });
+        
+        // Продолжаем анимацию
+        requestAnimationFrame(updateVisualizer);
+    }
+    
+    updateVisualizer();
+}
+
+function stopMicrophoneTest() {
+    const status = document.getElementById('audioTestStatus');
+    
+    if (testMicrophoneStream) {
+        testMicrophoneStream.getTracks().forEach(track => track.stop());
+        testMicrophoneStream = null;
+    }
+    
+    if (testAudioContext && testAudioContext.state !== 'closed') {
+        testAudioContext.close();
+        testAudioContext = null;
+        testAnalyser = null;
+    }
+    
+    status.textContent = '';
+    status.classList.remove('speaking');
+}
+
+function makeResizable(element) {
+    if (element.hasAttribute('data-resizable')) return;
+    
+    element.setAttribute('data-resizable', 'true');
+    
+    element.style.resize = 'both';
+    element.style.overflow = 'auto';
+    element.style.minWidth = '200px';
+    element.style.minHeight = '150px';
+    element.style.maxWidth = '90vw';
+    element.style.maxHeight = '90vh';
+    
+    const resizeHandle = document.createElement('div');
+    resizeHandle.className = 'resize-handle';
+    resizeHandle.innerHTML = '↘';
+    resizeHandle.style.cssText = `
+        position: absolute;
+        bottom: 5px;
+        right: 5px;
+        width: 20px;
+        height: 20px;
+        background: rgba(255,255,255,0.3);
+        cursor: nwse-resize;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 3px;
+        font-size: 12px;
+        color: white;
+        user-select: none;
+        z-index: 100;
+    `;
+    
+    element.appendChild(resizeHandle);
+    
+    let isResizing = false;
+    let startX, startY, startWidth, startHeight;
+    
+    resizeHandle.addEventListener('mousedown', (e) => {
+        isResizing = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        startWidth = parseInt(document.defaultView.getComputedStyle(element).width, 10);
+        startHeight = parseInt(document.defaultView.getComputedStyle(element).height, 10);
+        e.preventDefault();
+    });
+    
+    document.addEventListener('mousemove', (e) => {
+        if (!isResizing) return;
+        
+        const newWidth = startWidth + e.clientX - startX;
+        const newHeight = startHeight + e.clientY - startY;
+        
+        if (newWidth > 200 && newWidth < window.innerWidth * 0.9) {
+            element.style.width = newWidth + 'px';
+        }
+        if (newHeight > 150 && newHeight < window.innerHeight * 0.9) {
+            element.style.height = newHeight + 'px';
+        }
+    });
+    
+    document.addEventListener('mouseup', () => {
+        isResizing = false;
+    });
 }
 
 function getChannelIdByName(name) {
@@ -2139,9 +3569,24 @@ async function loadDMHistory(userId) {
    scrollToBottom();
 }
 
-console.log('Discord Clone initialized successfully!');
-if (currentUser) {
-   console.log('Logged in as:', currentUser.username);
+function requestNotificationPermission() {
+    if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission();
+    }
+}
+
+function showNotification(title, body) {
+    if ('Notification' in window && Notification.permission === 'granted') {
+        new Notification(title, { body, icon: '/assets/icon.png' });
+    }
+}
+
+function updateUserInfo() {
+    const userAvatar = document.querySelector('.user-avatar');
+    const username = document.querySelector('.username');
+    
+    if (userAvatar) userAvatar.textContent = currentUser.avatar;
+    if (username) username.textContent = currentUser.username;
 }
 
 function populateDMList(friends) {
@@ -2163,320 +3608,10 @@ function populateDMList(friends) {
         dmItem.innerHTML = `
             <div class="friend-avatar">${friend.avatar || friend.username.charAt(0).toUpperCase()}</div>
             <span>${friend.username}</span>
-            <!-- УБРАТЬ ЭТУ СТРОКУ: <button class="dm-call-btn" title="Call ${friend.username}" data-friend-id="${friend.id}">📞</button> -->
         `;
         dmItem.addEventListener('click', () => {
             startDM(friend.id, friend.username);
         });
         dmList.appendChild(dmItem);
-    });
-}
-
-// WebRTC Functions
-async function createPeerConnection(remoteSocketId, isInitiator) {
-    console.log(`Creating peer connection with ${remoteSocketId}, initiator: ${isInitiator}`);
-    
-    if (peerConnections[remoteSocketId]) {
-        console.log('Peer connection already exists');
-        return peerConnections[remoteSocketId];
-    }
-    
-    // Убеждаемся, что у нас есть локальный аудио поток
-    if (!localAudioStream) {
-        try {
-            await ensureLocalAudio();
-        } catch (error) {
-            console.error('Failed to get local audio stream:', error);
-            return null;
-        }
-    }
-    
-    const pc = new RTCPeerConnection({
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-            { urls: 'stun:stun3.l.google.com:19302' },
-            { urls: 'stun:stun4.l.google.com:19302' }
-        ],
-        iceCandidatePoolSize: 10
-    });
-
-    peerConnections[remoteSocketId] = pc;
-
-    // Добавляем локальный аудио поток
-    if (localAudioStream) {
-        const audioTracks = localAudioStream.getAudioTracks();
-        console.log(`Adding ${audioTracks.length} audio tracks`);
-        
-        audioTracks.forEach(track => {
-            console.log(`Adding audio track: ${track.label}, enabled: ${track.enabled}`);
-            pc.addTrack(track, localAudioStream);
-        });
-    }
-    
-    // Если есть экранный поток (демонстрация экрана), добавляем его тоже
-    if (screenStream) {
-        const videoTracks = screenStream.getVideoTracks();
-        console.log(`Adding ${videoTracks.length} video tracks from screen`);
-        
-        videoTracks.forEach(track => {
-            console.log(`Adding screen track: ${track.label}`);
-            pc.addTrack(track, screenStream);
-        });
-    }
-
-    // Handle ICE candidates
-    pc.onicecandidate = (event) => {
-        if (event.candidate) {
-            console.log('Sending ICE candidate to', remoteSocketId);
-            socket.emit('ice-candidate', {
-                to: remoteSocketId,
-                candidate: event.candidate
-            });
-        }
-    };
-    
-    // Handle connection state changes
-    pc.oniceconnectionstatechange = () => {
-        console.log(`ICE connection state for ${remoteSocketId}: ${pc.iceConnectionState}`);
-        if (pc.iceConnectionState === 'failed') {
-            console.error('ICE connection failed');
-        }
-        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-            console.log('Peer connection established successfully with', remoteSocketId);
-        }
-    };
-    
-    pc.onconnectionstatechange = () => {
-        console.log(`Connection state for ${remoteSocketId}: ${pc.connectionState}`);
-    };
-
-    // Handle incoming remote stream
-pc.ontrack = (event) => {
-    console.log('Received remote track from', remoteSocketId, 
-                'kind:', event.track.kind, 
-                'label:', event.track.label,
-                'streams:', event.streams.length);
-        
-        const remoteParticipants = document.getElementById('remoteParticipants');
-        
-        let participantDiv = document.getElementById(`participant-${remoteSocketId}`);
-        
-        if (!participantDiv) {
-            participantDiv = document.createElement('div');
-            participantDiv.className = 'participant';
-            participantDiv.id = `participant-${remoteSocketId}`;
-            
-            // Создаем аудио элемент для удаленного аудио
-            const audioElement = document.createElement('audio');
-            audioElement.id = `remote-audio-${remoteSocketId}`;
-            audioElement.className = 'audio-element';
-            audioElement.autoplay = true;
-            audioElement.playsInline = true;
-            audioElement.volume = isDeafened ? 0 : 1;
-            
-            const participantName = document.createElement('div');
-            participantName.className = 'participant-name';
-            participantName.textContent = 'Friend';
-            
-            const participantStatus = document.createElement('div');
-            participantStatus.className = 'participant-status';
-            participantStatus.textContent = 'Speaking...';
-            participantStatus.style.display = 'none';
-            
-            participantDiv.appendChild(audioElement);
-            participantDiv.appendChild(participantName);
-            participantDiv.appendChild(participantStatus);
-            remoteParticipants.appendChild(participantDiv);
-        }
-        
-        // Если это видео-трек (демонстрация экрана от другого пользователя)
-        if (event.track.kind === 'video') {
-            console.log('Received screen share from', remoteSocketId);
-            createRemoteScreenShareElement(remoteSocketId, event.streams[0]);
-        }
-        // Если это аудио-трек
-        else if (event.track.kind === 'audio') {
-            console.log('Setting remote audio stream for', remoteSocketId);
-            const audioElement = document.getElementById(`remote-audio-${remoteSocketId}`);
-            if (audioElement) {
-                audioElement.srcObject = event.streams[0];
-                
-                // Автоматическое воспроизведение
-                audioElement.play().catch(e => {
-                    console.error('Error playing remote audio:', e);
-                    // Пытаемся воспроизвести после пользовательского взаимодействия
-                    document.addEventListener('click', () => {
-                        audioElement.play().catch(err => console.error('Still cannot play:', err));
-                    }, { once: true });
-                });
-            }
-        }
-    };
-
-    // Create offer if initiator
-    if (isInitiator) {
-        try {
-            const offer = await pc.createOffer();
-            console.log('Created offer for', remoteSocketId);
-            await pc.setLocalDescription(offer);
-            console.log('Sending offer to:', remoteSocketId);
-            socket.emit('offer', {
-                to: remoteSocketId,
-                offer: pc.localDescription
-            });
-        } catch (error) {
-            console.error('Error creating offer:', error);
-        }
-    }
-    
-	debugPeerConnections();
-	
-    return pc;
-}
-
-// Создать элемент для удаленной демонстрации экрана
-function createRemoteScreenShareElement(socketId, stream) {
-    const remoteParticipants = document.getElementById('remoteParticipants');
-    
-    // Удаляем старый элемент если существует
-    const oldElement = document.getElementById(`screen-share-remote-${socketId}`);
-    if (oldElement) {
-        oldElement.remove();
-    }
-    
-    // Создаем контейнер для удаленной демонстрации экрана
-    const screenShareDiv = document.createElement('div');
-    screenShareDiv.className = 'participant screen-share remote';
-    screenShareDiv.id = `screen-share-remote-${socketId}`;
-    
-    // Создаем видео элемент
-    const videoElement = document.createElement('video');
-    videoElement.className = 'screen-video';
-    videoElement.autoplay = true;
-    videoElement.playsInline = true;
-    
-    const screenShareLabel = document.createElement('div');
-    screenShareLabel.className = 'participant-name';
-    screenShareLabel.textContent = `Friend's Screen`;
-    
-    const controlsDiv = document.createElement('div');
-    controlsDiv.className = 'screen-controls';
-    
-    // Кнопка развернуть на полный экран
-    const fullscreenBtn = document.createElement('button');
-    fullscreenBtn.className = 'screen-control-btn fullscreen-btn';
-    fullscreenBtn.innerHTML = '⛶';
-    fullscreenBtn.title = 'Fullscreen';
-    fullscreenBtn.onclick = () => {
-        if (videoElement.requestFullscreen) {
-            videoElement.requestFullscreen();
-        } else if (videoElement.webkitRequestFullscreen) {
-            videoElement.webkitRequestFullscreen();
-        } else if (videoElement.mozRequestFullScreen) {
-            videoElement.mozRequestFullScreen();
-        }
-    };
-    
-    controlsDiv.appendChild(fullscreenBtn);
-    
-    screenShareDiv.appendChild(videoElement);
-    screenShareDiv.appendChild(screenShareLabel);
-    screenShareDiv.appendChild(controlsDiv);
-    remoteParticipants.appendChild(screenShareDiv);
-    
-    // Устанавливаем поток в видео элемент
-    videoElement.srcObject = stream;
-    
-    // Автоматическое воспроизведение
-    videoElement.play().catch(e => {
-        console.error('Error playing remote screen share video:', e);
-    });
-    
-    // Добавляем возможность изменения размера
-    makeResizable(screenShareDiv);
-}
-
-function removeRemoteParticipant(socketId) {
-    const participantDiv = document.getElementById(`participant-${socketId}`);
-    if (participantDiv) {
-        participantDiv.remove();
-    }
-    
-    // Удаляем демонстрацию экрана если была
-    const remoteScreen = document.getElementById(`screen-share-remote-${socketId}`);
-    if (remoteScreen) {
-        remoteScreen.remove();
-    }
-}
-
-// Функция для создания возможности изменения размера элементов
-function makeResizable(element) {
-    if (element.hasAttribute('data-resizable')) return;
-    
-    element.setAttribute('data-resizable', 'true');
-    
-    // Добавляем стили для изменения размера
-    element.style.resize = 'both';
-    element.style.overflow = 'auto';
-    element.style.minWidth = '200px';
-    element.style.minHeight = '150px';
-    element.style.maxWidth = '90vw';
-    element.style.maxHeight = '90vh';
-    
-    // Добавляем индикатор изменения размера
-    const resizeHandle = document.createElement('div');
-    resizeHandle.className = 'resize-handle';
-    resizeHandle.innerHTML = '↘';
-    resizeHandle.style.cssText = `
-        position: absolute;
-        bottom: 5px;
-        right: 5px;
-        width: 20px;
-        height: 20px;
-        background: rgba(255,255,255,0.3);
-        cursor: nwse-resize;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 3px;
-        font-size: 12px;
-        color: white;
-        user-select: none;
-        z-index: 100;
-    `;
-    
-    element.appendChild(resizeHandle);
-    
-    // Добавляем обработчик для изменения размера
-    let isResizing = false;
-    let startX, startY, startWidth, startHeight;
-    
-    resizeHandle.addEventListener('mousedown', (e) => {
-        isResizing = true;
-        startX = e.clientX;
-        startY = e.clientY;
-        startWidth = parseInt(document.defaultView.getComputedStyle(element).width, 10);
-        startHeight = parseInt(document.defaultView.getComputedStyle(element).height, 10);
-        e.preventDefault();
-    });
-    
-    document.addEventListener('mousemove', (e) => {
-        if (!isResizing) return;
-        
-        const newWidth = startWidth + e.clientX - startX;
-        const newHeight = startHeight + e.clientY - startY;
-        
-        if (newWidth > 200 && newWidth < window.innerWidth * 0.9) {
-            element.style.width = newWidth + 'px';
-        }
-        if (newHeight > 150 && newHeight < window.innerHeight * 0.9) {
-            element.style.height = newHeight + 'px';
-        }
-    });
-    
-    document.addEventListener('mouseup', () => {
-        isResizing = false;
     });
 }
